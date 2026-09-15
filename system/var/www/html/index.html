@@ -644,7 +644,7 @@
 
     <!-- NAVBAR -->
     <nav class="navbar">
-        <div class="logo">Air<span>Coins</span></div>
+        <div class="logo" id="portalNavLogo">Air<span>Coins</span></div>
         <div class="nav-links">
             <a class="active">Home</a>
             <a href="admin.html">Admin</a>
@@ -662,8 +662,8 @@
         </div>
         
         <div class="hero">
-            <h1>Welcome to <span>AirCoins</span></h1>
-            <p>Fast & affordable PisoNet. Insert coins and get connected instantly!</p>
+            <h1>Welcome to <span id="portalHeroBrand">AirCoins</span></h1>
+            <p id="portalHeroTagline">Fast & affordable PisoNet. Insert coins and get connected instantly!</p>
         </div>
 
         <div class="status-card">
@@ -1224,6 +1224,24 @@
                         headerContainer.style.display = 'block';
                     } else if (headerContainer) {
                         headerContainer.style.display = 'none';
+                    }
+
+                    if (res.data && res.data.portal_title) {
+                        const title = res.data.portal_title.trim();
+                        if (title) {
+                            document.title = title + ' - PisoNet System';
+                            const logoEl = document.getElementById('portalNavLogo');
+                            if (logoEl) logoEl.textContent = title;
+                            const heroBrand = document.getElementById('portalHeroBrand');
+                            if (heroBrand) heroBrand.textContent = title;
+                        }
+                    }
+                    if (res.data && res.data.portal_tagline) {
+                        const tagline = res.data.portal_tagline.trim();
+                        if (tagline) {
+                            const taglineEl = document.getElementById('portalHeroTagline');
+                            if (taglineEl) taglineEl.textContent = tagline;
+                        }
                     }
                 })
                 .catch(err => warnOnce('appearance', err));

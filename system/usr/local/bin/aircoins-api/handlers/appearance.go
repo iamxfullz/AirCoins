@@ -93,6 +93,8 @@ func defaultAppearance() models.PortalAppearance {
 			ButtonText: "#1a1a2e",
 		},
 		BackgroundImage: "",
+		PortalTitle:     "AirCoins",
+		PortalTagline:   "Fast & affordable PisoNet. Insert coins and get connected instantly!",
 	}
 }
 
@@ -124,6 +126,16 @@ func validateAppearance(a *models.PortalAppearance) error {
 
 	if a.HeaderImage != "" && !backgroundImageRe.MatchString(a.HeaderImage) {
 		return fmt.Errorf("header_image must be empty or a filename under /%s/", portalAssetsDir)
+	}
+
+	a.PortalTitle = strings.TrimSpace(a.PortalTitle)
+	if len(a.PortalTitle) > 100 {
+		return fmt.Errorf("portal_title too long (max 100 characters)")
+	}
+
+	a.PortalTagline = strings.TrimSpace(a.PortalTagline)
+	if len(a.PortalTagline) > 250 {
+		return fmt.Errorf("portal_tagline too long (max 250 characters)")
 	}
 
 	// redirect_url is optional. When set it must be a well-formed absolute
@@ -163,6 +175,12 @@ func (h *AppearanceHandler) GetAppearance(w http.ResponseWriter, r *http.Request
 	if err == nil {
 		var stored models.PortalAppearance
 		if json.Unmarshal([]byte(value), &stored) == nil && validateAppearance(&stored) == nil {
+			if stored.PortalTitle == "" {
+				stored.PortalTitle = "AirCoins"
+			}
+			if stored.PortalTagline == "" {
+				stored.PortalTagline = "Fast & affordable PisoNet. Insert coins and get connected instantly!"
+			}
 			cfg = stored
 			if updatedAt.Valid {
 				cfg.UpdatedAt = updatedAt.Time.Format(time.RFC3339)
@@ -207,6 +225,12 @@ func (h *AppearanceHandler) SaveAppearance(w http.ResponseWriter, r *http.Reques
 	}
 	req.BackgroundImage = stored.BackgroundImage
 	req.HeaderImage = stored.HeaderImage
+	if req.PortalTitle == "" {
+		req.PortalTitle = "AirCoins"
+	}
+	if req.PortalTagline == "" {
+		req.PortalTagline = "Fast & affordable PisoNet. Insert coins and get connected instantly!"
+	}
 
 	if err := validateAppearance(&req); err != nil {
 		sendJSON(w, http.StatusBadRequest, models.APIResponse{Success: false, Message: err.Error()})
@@ -395,6 +419,12 @@ func (h *AppearanceHandler) loadAppearance() (models.PortalAppearance, error) {
 	if err == nil {
 		var stored models.PortalAppearance
 		if json.Unmarshal([]byte(value), &stored) == nil && validateAppearance(&stored) == nil {
+			if stored.PortalTitle == "" {
+				stored.PortalTitle = "AirCoins"
+			}
+			if stored.PortalTagline == "" {
+				stored.PortalTagline = "Fast & affordable PisoNet. Insert coins and get connected instantly!"
+			}
 			cfg = stored
 		}
 	} else if err != sql.ErrNoRows {

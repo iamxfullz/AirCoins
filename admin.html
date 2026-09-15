@@ -2243,6 +2243,30 @@
                         </div>
                     </div>
 
+                    <!-- Portal Branding / Vendo Name -->
+                    <div class="settings-card">
+                        <div class="card-title">Portal Branding &amp; Vendo Name</div>
+                        <div class="gpio-info-text" style="margin-bottom:12px;">
+                            Customize the brand name and greeting tagline displayed to customers on the captive portal home screen (10.0.0.1).
+                        </div>
+                        <div class="settings-form">
+                            <div class="settings-field" style="margin-bottom:12px;">
+                                <label for="portal-title-input" style="font-weight:600; color:#cdd6f4; margin-bottom:6px; display:block;">Portal Brand Name</label>
+                                <input type="text" id="portal-title-input" placeholder="e.g. AirCoins, JuanWifi, Barangay PisoWifi"
+                                       style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#fff; font-size:14px;"
+                                       autocomplete="off" oninput="updatePortalPreview()">
+                                <div class="gpio-info-text" style="margin-top:4px;">Shown in navbar logo, hero greeting, and browser title. Leave blank for default (AirCoins).</div>
+                            </div>
+                            <div class="settings-field" style="margin-bottom:12px;">
+                                <label for="portal-tagline-input" style="font-weight:600; color:#cdd6f4; margin-bottom:6px; display:block;">Portal Tagline / Subtitle</label>
+                                <input type="text" id="portal-tagline-input" placeholder="e.g. Fast & affordable PisoNet. Insert coins and get connected instantly!"
+                                       style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#fff; font-size:14px;"
+                                       autocomplete="off">
+                                <div class="gpio-info-text" style="margin-top:4px;">Greeting subtitle shown beneath the welcome header.</div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Post-Payment Redirect -->
                     <div class="settings-card">
                         <div class="card-title">Post-Payment Redirect</div>
@@ -5524,7 +5548,13 @@ function updatePortalPreview() {
         pv.style.background = bg;
     }
     pv.style.color = isDark ? L.text : c.text;
-    document.getElementById('pv-hero-accent').style.color = isDark ? L.accent : c.accent;
+    var titleInput = document.getElementById('portal-title-input');
+    var currentTitle = (titleInput && titleInput.value.trim()) || (portalAppearance && portalAppearance.portal_title) || 'AirCoins';
+    var heroAccent = document.getElementById('pv-hero-accent');
+    if (heroAccent) {
+        heroAccent.style.color = isDark ? L.accent : c.accent;
+        heroAccent.textContent = currentTitle;
+    }
     var card = document.getElementById('pv-card');
     card.style.background = isDark ? L.card : c.card;
     card.style.color = isDark ? L.text : c.text;
@@ -5573,16 +5603,24 @@ async function loadPortalAppearance() {
             colors: Object.assign({}, PORTAL_THEMES.dark.colors, res.data.colors),
             background_image: res.data.background_image || '',
             header_image: res.data.header_image || '',
-            redirect_url: res.data.redirect_url || ''
+            redirect_url: res.data.redirect_url || '',
+            portal_title: res.data.portal_title || '',
+            portal_tagline: res.data.portal_tagline || ''
         };
         var ru = document.getElementById('portal-redirect-url');
         if (ru) ru.value = portalAppearance.redirect_url;
+        var pTitle = document.getElementById('portal-title-input');
+        if (pTitle) pTitle.value = portalAppearance.portal_title;
+        var pTagline = document.getElementById('portal-tagline-input');
+        if (pTagline) pTagline.value = portalAppearance.portal_tagline;
     } catch (e) {
         portalAppearance = {
             theme: 'dark',
             colors: Object.assign({}, PORTAL_THEMES.dark.colors),
             background_image: '',
-            redirect_url: ''
+            redirect_url: '',
+            portal_title: 'AirCoins',
+            portal_tagline: 'Fast & affordable PisoNet. Insert coins and get connected instantly!'
         };
         showNotification('Failed to load portal appearance: ' + e.message, 'error');
     }
@@ -5591,19 +5629,24 @@ async function loadPortalAppearance() {
 
 async function savePortalAppearance() {
     if (!portalAppearance) return;
-    // Pull the live redirect URL out of the input field.
+    // Pull the live redirect URL, portal title, and tagline from input fields.
     var ru = document.getElementById('portal-redirect-url');
     var redirectUrl = ru ? ru.value.trim() : '';
+    var pTitle = document.getElementById('portal-title-input');
+    var portalTitle = pTitle ? pTitle.value.trim() : '';
+    var pTagline = document.getElementById('portal-tagline-input');
+    var portalTagline = pTagline ? pTagline.value.trim() : '';
     try {
-        // background_image is deliberately NOT sent: the server owns it
-        // (the upload/remove endpoints persist it themselves) and ignores
-        // whatever a client would put here.
         await apiCall('POST', '/admin/portal/appearance', {
             theme: portalAppearance.theme,
             colors: portalAppearance.colors,
-            redirect_url: redirectUrl
+            redirect_url: redirectUrl,
+            portal_title: portalTitle,
+            portal_tagline: portalTagline
         });
-        showNotification('Portal appearance saved', 'success');
+        portalAppearance.portal_title = portalTitle;
+        portalAppearance.portal_tagline = portalTagline;
+        showNotification('Portal branding & appearance saved', 'success');
     } catch (e) {
         showNotification('Failed to save portal appearance: ' + e.message, 'error');
     }
@@ -5614,7 +5657,12 @@ async function savePortalAppearance() {
 function resetPortalToDefault() {
     if (!portalAppearance) return;
     selectPortalTheme('dark');
-    showNotification('Editor reset to the Dark preset — press Save to apply', 'info');
+    var pTitle = document.getElementById('portal-title-input');
+    if (pTitle) pTitle.value = 'AirCoins';
+    var pTagline = document.getElementById('portal-tagline-input');
+    if (pTagline) pTagline.value = 'Fast & affordable PisoNet. Insert coins and get connected instantly!';
+    updatePortalPreview();
+    showNotification('Editor reset to default — press Save to apply', 'info');
 }
 
 async function uploadPortalBackground() {

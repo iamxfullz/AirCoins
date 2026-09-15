@@ -456,8 +456,10 @@ type PortalAppearance struct {
 	// RedirectURL is optional: when set, the portal offers to send the
 	// client to this link right after a successful coin payment / session
 	// start. Empty = no post-payment redirect.
-	RedirectURL string `json:"redirect_url,omitempty"`
-	UpdatedAt   string `json:"updated_at,omitempty"`
+	RedirectURL     string       `json:"redirect_url,omitempty"`
+	PortalTitle     string       `json:"portal_title,omitempty"`
+	PortalTagline   string       `json:"portal_tagline,omitempty"`
+	UpdatedAt       string       `json:"updated_at,omitempty"`
 }
 
 // ============================================
