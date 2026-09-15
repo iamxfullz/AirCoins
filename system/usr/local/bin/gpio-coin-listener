@@ -191,6 +191,39 @@ log "GPIO method: $GPIO_METHOD"
 log "Listening on PHYSICAL header pin: $COIN_PULSE_PIN"
 log "Coin value per pulse: P$COIN_VALUE (acceptor must send 1 pulse per peso: P5 = 5 pulses, P10 = 10 pulses)"
 log "Pulse debounce: ${DEBOUNCE_MS} ms"
+
+check_relay_availability() {
+    local relay_gpio relay_label relay_note busy_msg="" busy_flag=2
+    relay_gpio=$(pin_to_gpio "$RELAY_PIN" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$relay_gpio" ]; then
+        log "ERROR: relay pin $RELAY_PIN is not a usable GPIO on $BOARD_FAMILY/$BOARD_CHIPSET"
+        log "ERROR: Available physical pins: $(get_available_pins)"
+        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
+        RELAY_USABLE=false
+        return 1
+    fi
+    relay_label=$(pin_to_label "$RELAY_PIN")
+    log "Relay pin: physical pin $RELAY_PIN = $relay_label = $GPIO_CHIP_NAME line $relay_gpio"
+    relay_note=$(pin_conflict_note "$RELAY_PIN")
+    if [ -n "$relay_note" ]; then
+        log "NOTE: $relay_note"
+    fi
+    if [ "$GPIO_METHOD" != "none" ]; then
+        gpio_line_busy "$RELAY_PIN"
+        busy_flag=$?
+        busy_msg="$GPIO_BUSY_REASON"
+    fi
+    if [ "$busy_flag" = "0" ]; then
+        log "ERROR: relay pin $RELAY_PIN ($GPIO_CHIP_NAME line $relay_gpio) IS BUSY"
+        log "ERROR: $busy_msg"
+        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
+        RELAY_USABLE=false
+        return 1
+    fi
+    RELAY_USABLE=true
+    return 0
+}
+
 if [ "$RELAY_ENABLED" = "true" ]; then
     log "Relay/light: ENABLED on physical pin $RELAY_PIN (blink tempo $RELAY_INTENSITY/10 while armed)"
     check_relay_availability
@@ -331,38 +364,6 @@ handle_coin_pulse() {
 
     # Quick bright flash on the relay/light for feedback
     relay_coin_flash
-}
-
-check_relay_availability() {
-    local relay_gpio relay_label relay_note busy_msg="" busy_flag=2
-    relay_gpio=$(pin_to_gpio "$RELAY_PIN" 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$relay_gpio" ]; then
-        log "ERROR: relay pin $RELAY_PIN is not a usable GPIO on $BOARD_FAMILY/$BOARD_CHIPSET"
-        log "ERROR: Available physical pins: $(get_available_pins)"
-        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
-        RELAY_USABLE=false
-        return 1
-    fi
-    relay_label=$(pin_to_label "$RELAY_PIN")
-    log "Relay pin: physical pin $RELAY_PIN = $relay_label = $GPIO_CHIP_NAME line $relay_gpio"
-    relay_note=$(pin_conflict_note "$RELAY_PIN")
-    if [ -n "$relay_note" ]; then
-        log "NOTE: $relay_note"
-    fi
-    if [ "$GPIO_METHOD" != "none" ]; then
-        gpio_line_busy "$RELAY_PIN"
-        busy_flag=$?
-        busy_msg="$GPIO_BUSY_REASON"
-    fi
-    if [ "$busy_flag" = "0" ]; then
-        log "ERROR: relay pin $RELAY_PIN ($GPIO_CHIP_NAME line $relay_gpio) IS BUSY"
-        log "ERROR: $busy_msg"
-        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
-        RELAY_USABLE=false
-        return 1
-    fi
-    RELAY_USABLE=true
-    return 0
 }
 
 relay_off() {
@@ -635,7 +636,7 @@ if [ "$GPIO_METHOD" != "none" ]; then
         # failures we give up on this armed window — the next arm attempt
         # will retry, and if setup keeps failing the startup-level failure
         # above (or the next re-arm) will exit non-zero for systemd retry.
-        local setup_ok=1
+        setup_ok=1
         for _setup_try in 1 2 3; do
             if gpio_setup_input "$COIN_PULSE_PIN" "up" 2>/dev/null; then
                 setup_ok=0
