@@ -414,7 +414,58 @@ func (h *LicenseHandler) HeartbeatSupabase() error {
 			}
 		}
 	} else {
-		// Trial device: POST a heartbeat row so Supabase knows this device exists
+		// Auto-Recovery Check: See if this hardware ID is already licensed in Supabase (e.g. after fresh re-flash or DB wipe)
+		findURL := fmt.Sprintf("%s/rest/v1/aircoins_licenses?hardware_id=eq.%s&status=eq.active&select=*&limit=1", baseURL, hwID)
+		if fReq, err := supabaseRequest(http.MethodGet, findURL, nil); err == nil {
+			if fResp, err := client.Do(fReq); err == nil {
+				defer fResp.Body.Close()
+				if fResp.StatusCode == http.StatusOK {
+					fBody, _ := io.ReadAll(fResp.Body)
+					var fRows []map[string]interface{}
+					if json.Unmarshal(fBody, &fRows) == nil && len(fRows) > 0 {
+						recoveredKey, _ := fRows[0]["license_key"].(string)
+						recoveredEmail, _ := fRows[0]["owner_email"].(string)
+						if recoveredKey != "" {
+							log.Printf("license: AUTO-RECOVERY SUCCESS — active cloud license %s restored for hardware %s", maskKey(recoveredKey), hwID)
+							h.mu.Lock()
+							h.state.Status = "active"
+							h.state.LicenseKey = recoveredKey
+							h.state.OwnerEmail = recoveredEmail
+							h.state.LastHeartbeatAt = &now
+							h.state.LastSupabaseResponseAt = &now
+							h.state.LastSupabaseError = ""
+							if actStr, ok := fRows[0]["activated_at"].(string); ok && actStr != "" {
+								if t, err := time.Parse(time.RFC3339, actStr); err == nil {
+									h.state.ActivatedAt = &t
+								}
+							}
+							if expStr, ok := fRows[0]["expires_at"].(string); ok && expStr != "" {
+								if t, err := time.Parse(time.RFC3339, expStr); err == nil {
+									h.state.ExpiresAt = &t
+								}
+							}
+							h.mu.Unlock()
+							h.saveState()
+
+							// Heartbeat the recovered license immediately
+							patchURL := fmt.Sprintf("%s/rest/v1/aircoins_licenses?license_key=eq.%s", baseURL, recoveredKey)
+							patchBody, _ := json.Marshal(map[string]interface{}{
+								"last_heartbeat_at": now.Format(time.RFC3339),
+							})
+							if patchReq, err := supabaseRequest(http.MethodPatch, patchURL, bytes.NewReader(patchBody)); err == nil {
+								if pResp, err := client.Do(patchReq); err == nil {
+									pResp.Body.Close()
+								}
+							}
+							log.Printf("license: heartbeat ok (status=active, auto-recovered)")
+							return nil
+						}
+					}
+				}
+			}
+		}
+
+		// Trial device without registered active cloud license: POST heartbeat row
 		postURL := baseURL + "/rest/v1/aircoins_license_heartbeats"
 		postBody, _ := json.Marshal(map[string]interface{}{
 			"hardware_id": hwID,
@@ -489,14 +540,20 @@ func (h *LicenseHandler) ActivateLicense(key, email string) error {
 	row := rows[0]
 
 	remoteStatus, _ := row["status"].(string)
-	if remoteStatus != "available" {
-		return fmt.Errorf("license is not available (current status: %s)", remoteStatus)
-	}
-
 	remoteHW, _ := row["hardware_id"].(string)
 	h.mu.RLock()
 	localHW := h.state.HardwareID
 	h.mu.RUnlock()
+
+	// Re-activation check: if the key is already active on THIS physical hardware, allow seamless re-activation
+	isSameHardware := (remoteHW == localHW && localHW != "")
+	if remoteStatus != "available" && !(remoteStatus == "active" && isSameHardware) {
+		if remoteStatus == "active" {
+			return fmt.Errorf("license is already active on different hardware")
+		}
+		return fmt.Errorf("license is not available (current status: %s)", remoteStatus)
+	}
+
 	if remoteHW != "" && remoteHW != localHW {
 		return fmt.Errorf("license is bound to different hardware")
 	}
@@ -608,6 +665,15 @@ func (h *LicenseHandler) saveState() {
 // HTTP HANDLERS
 // ============================================
 
+func maskKey(k string) string {
+	if len(k) > 4 {
+		return "****" + k[len(k)-4:]
+	} else if len(k) > 0 {
+		return "****"
+	}
+	return ""
+}
+
 // Status returns the current license state and whether it is valid.
 func (h *LicenseHandler) Status(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -619,12 +685,7 @@ func (h *LicenseHandler) Status(w http.ResponseWriter, r *http.Request) {
 	valid := h.isLicenseValidLocked()
 	h.mu.RUnlock()
 
-	maskedKey := ""
-	if len(st.LicenseKey) > 4 {
-		maskedKey = "****" + st.LicenseKey[len(st.LicenseKey)-4:]
-	} else if len(st.LicenseKey) > 0 {
-		maskedKey = "****"
-	}
+	maskedKey := maskKey(st.LicenseKey)
 
 	resp := map[string]interface{}{
 		"status":                    st.Status,

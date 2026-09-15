@@ -461,7 +461,8 @@ echo "HTML updated"
 for s in gpio-coin-listener aircoins-gpio-lib aircoins-captive-rules pisowifi-api-update pisowifi-ctl pisowifi-session-manager; do
     [ -f "$DIR/system/usr/local/bin/$s" ] && sudo cp "$DIR/system/usr/local/bin/$s" /usr/local/bin/$s && sudo chmod +x /usr/local/bin/$s
 done
-echo "Scripts updated"
+sudo sed -i -e 's/\r$//' /usr/local/bin/aircoins-* /usr/local/bin/gpio-coin-listener /usr/local/bin/pisowifi-* 2>/dev/null || true
+echo "Scripts updated and normalized"
 # Restart the coin listener so the new script+lib actually load into
 # memory. bash daemons keep executing the OLD code they read at startup
 # until restarted, so without this step every listener fix shipped via
@@ -500,6 +501,8 @@ LITEOF
         sudo cp /etc/lighttpd/lighttpd.conf.bak-aircoins /etc/lighttpd/lighttpd.conf
     fi
 fi
+# Ensure /var/log/lighttpd permissions
+[ -f "$DIR/system/etc/tmpfiles.d/lighttpd.conf" ] && sudo cp "$DIR/system/etc/tmpfiles.d/lighttpd.conf" /etc/tmpfiles.d/lighttpd.conf && sudo systemd-tmpfiles --create /etc/tmpfiles.d/lighttpd.conf 2>/dev/null || true
 # Update CHANGELOG
 [ -f "$DIR/CHANGELOG.md" ] && sudo cp "$DIR/CHANGELOG.md" /opt/aircoins/CHANGELOG.md
 # Restart services with retry — a single start can lose a race with the stop

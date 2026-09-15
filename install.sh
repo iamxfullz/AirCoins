@@ -558,7 +558,9 @@ fi
 # Ensure /var/log/lighttpd is preserved across Armbian ramlog reboots
 mkdir -p /var/log/lighttpd /etc/tmpfiles.d
 chown -R www-data:www-data /var/log/lighttpd
+chmod 750 /var/log/lighttpd
 echo "d /var/log/lighttpd 0750 www-data www-data -" > /etc/tmpfiles.d/lighttpd.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/lighttpd.conf 2>/dev/null || true
 
 # Validate and load the new config (captive portal redirects live here)
 if lighttpd -t -f /etc/lighttpd/lighttpd.conf > /dev/null 2>&1; then
