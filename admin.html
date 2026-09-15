@@ -7798,15 +7798,20 @@ function renderVersionCards(data) {
         // Buttons
         var buttonsHtml = '';
         if (isCurrent) {
-            buttonsHtml = '<span style="font-size:12px;color:#4caf50;">&#10003; This is the current version</span>';
+            buttonsHtml = '<span style="font-size:12px;color:#4caf50;font-weight:600;">&#10003; This is the current version</span>';
         } else {
             var dlBtnId = 'dl-btn-' + ver.replace(/\./g, '-');
             var instBtnId = 'inst-btn-' + ver.replace(/\./g, '-');
             if (isDownloaded) {
-                buttonsHtml = '<button id="' + instBtnId + '" class="btn btn-primary" onclick="installVersion(\'' + ver + '\')" style="padding:6px 16px;font-size:12px;">&#9889; Install</button>'
+                var instLabel = isNewer ? '&#9889; Install Update' : '&#8634; Rollback to ' + escapeHtml(ver);
+                buttonsHtml = '<button id="' + instBtnId + '" class="btn btn-primary" onclick="installVersion(\'' + ver + '\')" style="padding:6px 16px;font-size:12px;">' + instLabel + '</button>'
                     + '<button class="btn btn-ghost" onclick="deleteVersion(\'' + ver + '\')" style="padding:6px 12px;font-size:12px;color:#f44336;" title="Delete downloaded file">&#10005;</button>';
             } else {
-                buttonsHtml = '<button id="' + dlBtnId + '" class="btn" onclick="downloadVersion(\'' + ver + '\')" style="padding:6px 16px;font-size:12px;background:#2196f3;color:#fff;border:none;border-radius:6px;cursor:pointer;">&#11015; Download</button>';
+                if (isNewer) {
+                    buttonsHtml = '<button id="' + dlBtnId + '" class="btn" onclick="downloadVersion(\'' + ver + '\')" style="padding:6px 16px;font-size:12px;background:#00bcd4;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">&#11015; Download</button>';
+                } else {
+                    buttonsHtml = '<button id="' + dlBtnId + '" class="btn btn-secondary" onclick="downloadVersion(\'' + ver + '\')" style="padding:6px 14px;font-size:12px;background:rgba(255,255,255,0.06);color:#bbb;border:1px solid rgba(255,255,255,0.14);border-radius:6px;cursor:pointer;" title="Rollback to older version">&#8634; Rollback</button>';
+                }
             }
         }
 
