@@ -352,8 +352,10 @@ func main() {
 	mux.Handle("/api/admin/updater/download", adminProtected(downloadRouter))
 	mux.Handle("/api/admin/updater/downloaded", adminProtected(updaterHandler.CheckDownloadedFile))
 
+	currentVersion := resolveVersion()
+
 	// Health check
-	mux.HandleFunc("/api/health", handlers.SystemHealth(Version))
+	mux.HandleFunc("/api/health", handlers.SystemHealth(currentVersion))
 
 	// Recover iptables auth state for surviving sessions (reboot safety)
 	// and enforce wall-clock expiry every 30s in the background.
@@ -368,9 +370,9 @@ func main() {
 	port := getEnv("PORT", "8080")
 	addr := ":" + port
 
-	handlers.SetAPIVersion(Version)
+	handlers.SetAPIVersion(currentVersion)
 
-	log.Printf("AirCoins API %s starting on %s", Version, addr)
+	log.Printf("AirCoins API %s starting on %s", currentVersion, addr)
 
 	// Enable CORS for development
 	handler := enableCORS(mux)
@@ -378,6 +380,29 @@ func main() {
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// resolveVersion returns the stamped build Version, or falls back to
+// AIRCOINS_VERSION env var or /opt/aircoins/VERSION on-disk tag file.
+func resolveVersion() string {
+	if Version != "" && Version != "dev" {
+		return Version
+	}
+	if envV := strings.TrimSpace(os.Getenv("AIRCOINS_VERSION")); envV != "" {
+		return envV
+	}
+	for _, p := range []string{"/opt/aircoins/VERSION", "/etc/aircoins-version", "/var/lib/pisowifi/version"} {
+		if data, err := os.ReadFile(p); err == nil {
+			v := strings.TrimSpace(string(data))
+			if v != "" {
+				if !strings.HasPrefix(v, "v") {
+					v = "v" + v
+				}
+				return v
+			}
+		}
+	}
+	return "dev"
 }
 
 func getEnv(key, defaultValue string) string {

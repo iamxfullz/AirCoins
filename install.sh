@@ -357,7 +357,13 @@ else
     chmod +x /usr/local/bin/aircoins-api/aircoins-api
 fi
 
-echo -e "${GREEN}  ✓ Go API built and deployed${NC}"
+# Write version tag files so API and Updater always know the active release
+mkdir -p /opt/aircoins /var/lib/pisowifi /etc/aircoins
+echo "v$VERSION" > /opt/aircoins/VERSION
+echo "v$VERSION" > /var/lib/pisowifi/version
+echo "v$VERSION" > /etc/aircoins-version
+
+echo -e "${GREEN}  ✓ Go API built and deployed (version v${VERSION})${NC}"
 
 cd "$SCRIPT_DIR"
 
