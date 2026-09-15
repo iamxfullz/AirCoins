@@ -2013,7 +2013,13 @@
             btn.disabled = true;
             try {
                 var url = state.sessionPaused ? '/api/session/resume' : '/api/session/pause';
-                var resp = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' } });
+                var resp = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Session-Token': getSessionToken()
+                    }
+                });
                 var res = await resp.json();
                 if (res && res.success) {
                     if (state.sessionPaused) {

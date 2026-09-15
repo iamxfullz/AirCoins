@@ -134,7 +134,8 @@ func migrateSessionMAC(db *sql.DB, sessionID int, oldIP, oldMAC, newIP, newMAC, 
 
 	// Re-read session (may have been migrated by a concurrent poll)
 	var currentMAC string
-	err := db.QueryRow(`SELECT COALESCE(client_mac,'') FROM sessions WHERE id = $1 AND status = 'active'`, sessionID).Scan(&currentMAC)
+	var pausedAt sql.NullTime
+	err := db.QueryRow(`SELECT COALESCE(client_mac,''), paused_at FROM sessions WHERE id = $1 AND status = 'active'`, sessionID).Scan(&currentMAC, &pausedAt)
 	if err != nil {
 		return fmt.Errorf("re-read session %d: %w", sessionID, err)
 	}
@@ -170,6 +171,21 @@ func migrateSessionMAC(db *sql.DB, sessionID int, oldIP, oldMAC, newIP, newMAC, 
 	}
 
 	// Post-commit (non-fatal): iptables + tc adjustments
+	if pausedAt.Valid {
+		// CRITICAL FIX: The session is PAUSED. Internet must remain completely BLOCKED
+		// for both the old MAC and the newly adopted MAC.
+		// Never call runCaptiveRules("auth") or EnsurePerDeviceClass("add") for a paused session!
+		runCaptiveRules(db, "unauth", oldMAC, "token-migrate-paused")
+		EnsurePerDeviceClass(db, "", oldMAC, oldIP, "remove")
+		runCaptiveRules(db, "unauth", newMAC, "token-migrate-paused")
+		EnsurePerDeviceClass(db, "", newMAC, newIP, "remove")
+
+		logAction(db, "INFO", "session", fmt.Sprintf("session %d (PAUSED) migrated from %s/%s to %s/%s via token %s (internet kept blocked until resumed)",
+			sessionID, oldMAC, oldIP, newMAC, newIP, token))
+		return nil
+	}
+
+	// Session is actively running: unauth old MAC, auth new MAC
 	runCaptiveRules(db, "unauth", oldMAC, "token-migrate")
 	EnsurePerDeviceClass(db, "", oldMAC, oldIP, "remove")
 	runCaptiveRules(db, "auth", newMAC, "token-migrate")
@@ -1068,21 +1084,32 @@ func (h *SessionHandler) Pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sessionToken := r.Header.Get("X-Session-Token")
+
 	// F4: Load pause rules and check the per-session pause limit.
 	pauseRules := loadPauseRules(h.DB)
 
-	// Find the active, non-paused session for this MAC
+	// Find the active, non-paused session for this MAC or token
 	var id int
 	var expiresAt time.Time
 	var pauseCount sql.NullInt64
 	var pausable bool
 	var expirationHours int
+	var dbMAC string
 	err := h.DB.QueryRow(`
-		SELECT id, expires_at, COALESCE(pause_count, 0), COALESCE(pausable, true), COALESCE(expiration_hours, 0) FROM sessions
+		SELECT id, expires_at, COALESCE(pause_count, 0), COALESCE(pausable, true), COALESCE(expiration_hours, 0), COALESCE(client_mac, '') FROM sessions
 		WHERE status = 'active' AND expires_at > NOW() AND paused_at IS NULL
 		  AND client_mac = $1
 		ORDER BY started_at DESC LIMIT 1
-	`, clientMAC).Scan(&id, &expiresAt, &pauseCount, &pausable, &expirationHours)
+	`, clientMAC).Scan(&id, &expiresAt, &pauseCount, &pausable, &expirationHours, &dbMAC)
+	if err == sql.ErrNoRows && sessionToken != "" {
+		err = h.DB.QueryRow(`
+			SELECT id, expires_at, COALESCE(pause_count, 0), COALESCE(pausable, true), COALESCE(expiration_hours, 0), COALESCE(client_mac, '') FROM sessions
+			WHERE status = 'active' AND expires_at > NOW() AND paused_at IS NULL
+			  AND session_token = $1
+			ORDER BY started_at DESC LIMIT 1
+		`, sessionToken).Scan(&id, &expiresAt, &pauseCount, &pausable, &expirationHours, &dbMAC)
+	}
 	if err == sql.ErrNoRows {
 		sendJSON(w, http.StatusNotFound, models.APIResponse{Success: false, Message: "No active non-paused session found"})
 		return
@@ -1132,9 +1159,11 @@ func (h *SessionHandler) Pause(w http.ResponseWriter, r *http.Request) {
 		UPDATE sessions
 		SET paused_at = NOW(), remaining_seconds_at_pause = $1,
 		    pause_count = COALESCE(pause_count, 0) + 1,
-		    pause_expires_at = $2
-		WHERE id = $3 AND status = 'active' AND expires_at > NOW() AND paused_at IS NULL
-	`, remaining, pauseDeadline, id)
+		    pause_expires_at = $2,
+		    client_ip = $3,
+		    client_mac = $4
+		WHERE id = $5 AND status = 'active' AND expires_at > NOW() AND paused_at IS NULL
+	`, remaining, pauseDeadline, clientIP, clientMAC, id)
 	if err != nil {
 		log.Printf("Pause: update failed: %v", err)
 		sendJSON(w, http.StatusInternalServerError, models.APIResponse{Success: false, Message: "Failed to pause session"})
@@ -1146,10 +1175,13 @@ func (h *SessionHandler) Pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Close internet access for this MAC
+	// Close internet access for this MAC and old MAC if roamed
 	runCaptiveRules(h.DB, "unauth", clientMAC, "pause")
-	// Remove per-device tc class+filter for FQ_CODEL per-device mode.
 	EnsurePerDeviceClass(h.DB, "", clientMAC, clientIP, "remove")
+	if dbMAC != "" && dbMAC != clientMAC {
+		runCaptiveRules(h.DB, "unauth", dbMAC, "pause")
+		EnsurePerDeviceClass(h.DB, "", dbMAC, "", "remove")
+	}
 
 	pausedAt := time.Now()
 	logAction(h.DB, "INFO", "session", "Session "+strconv.Itoa(id)+" paused ("+clientMAC+"): "+strconv.Itoa(remaining)+"s remaining")
@@ -1178,15 +1210,26 @@ func (h *SessionHandler) Resume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find the active, currently-paused session
+	sessionToken := r.Header.Get("X-Session-Token")
+
+	// Find the active, currently-paused session by MAC or token
 	var id, remainingAtPause int
 	var pauseDeadline sql.NullTime
+	var dbMAC string
 	err := h.DB.QueryRow(`
-		SELECT id, COALESCE(remaining_seconds_at_pause, 0), pause_expires_at FROM sessions
+		SELECT id, COALESCE(remaining_seconds_at_pause, 0), pause_expires_at, COALESCE(client_mac, '') FROM sessions
 		WHERE status = 'active' AND paused_at IS NOT NULL
 		  AND client_mac = $1
 		ORDER BY started_at DESC LIMIT 1
-	`, clientMAC).Scan(&id, &remainingAtPause, &pauseDeadline)
+	`, clientMAC).Scan(&id, &remainingAtPause, &pauseDeadline, &dbMAC)
+	if err == sql.ErrNoRows && sessionToken != "" {
+		err = h.DB.QueryRow(`
+			SELECT id, COALESCE(remaining_seconds_at_pause, 0), pause_expires_at, COALESCE(client_mac, '') FROM sessions
+			WHERE status = 'active' AND paused_at IS NOT NULL
+			  AND session_token = $1
+			ORDER BY started_at DESC LIMIT 1
+		`, sessionToken).Scan(&id, &remainingAtPause, &pauseDeadline, &dbMAC)
+	}
 	if err == sql.ErrNoRows {
 		sendJSON(w, http.StatusNotFound, models.APIResponse{Success: false, Message: "No active paused session found"})
 		return
@@ -1218,9 +1261,11 @@ func (h *SessionHandler) Resume(w http.ResponseWriter, r *http.Request) {
 		UPDATE sessions
 		SET paused_at = NULL, remaining_seconds_at_pause = NULL, pause_expires_at = NULL,
 		    expires_at = NOW() + ($1::int * INTERVAL '1 second'),
-		    remaining_seconds = $1
-		WHERE id = $2 AND status = 'active' AND paused_at IS NOT NULL
-	`, remainingAtPause, id)
+		    remaining_seconds = $1,
+		    client_ip = $2,
+		    client_mac = $3
+		WHERE id = $4 AND status = 'active' AND paused_at IS NOT NULL
+	`, remainingAtPause, clientIP, clientMAC, id)
 	if err != nil {
 		log.Printf("Resume: update failed: %v", err)
 		sendJSON(w, http.StatusInternalServerError, models.APIResponse{Success: false, Message: "Failed to resume session"})
@@ -1230,6 +1275,12 @@ func (h *SessionHandler) Resume(w http.ResponseWriter, r *http.Request) {
 	if n == 0 {
 		sendJSON(w, http.StatusConflict, models.APIResponse{Success: false, Message: "No active paused session to resume"})
 		return
+	}
+
+	// If the session was bound to an older MAC, clean up the old MAC
+	if dbMAC != "" && dbMAC != clientMAC {
+		runCaptiveRules(h.DB, "unauth", dbMAC, "resume-migrate-old")
+		EnsurePerDeviceClass(h.DB, "", dbMAC, "", "remove")
 	}
 
 	// Re-open internet access
@@ -1375,6 +1426,25 @@ func StartExpiryEnforcer(db *sql.DB) {
 				continue
 			}
 			runCaptiveRules(db, "auth", mac, "startup-recovery")
+		}
+	}
+
+	// Purge stale captive rules for any active PAUSED sessions.
+	// This ensures that any MAC from a paused session (including roamed MACs
+	// or sessions that survived an API restart) has its internet strictly blocked.
+	pausedRows, err := db.Query(`
+		SELECT DISTINCT client_mac FROM sessions
+		WHERE status = 'active' AND paused_at IS NOT NULL
+		  AND COALESCE(client_mac, '') <> ''
+	`)
+	if err == nil {
+		defer pausedRows.Close()
+		for pausedRows.Next() {
+			var mac string
+			if err := pausedRows.Scan(&mac); err == nil && mac != "" {
+				runCaptiveRules(db, "unauth", mac, "startup-paused-sync")
+				EnsurePerDeviceClass(db, "", mac, "", "remove")
+			}
 		}
 	}
 
