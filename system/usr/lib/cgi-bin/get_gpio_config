@@ -1,0 +1,83 @@
+#!/bin/bash
+# ============================================
+# AirCoins - GPIO Config Read CGI Handler
+# ============================================
+# Outputs the current GPIO config + platform state as JSON.
+# Called from admin panel on load to display the "Enable GPIO"
+# master toggle and the x86/no-GPIO platform notice.
+#
+# Only READS: detect_board / get_gpio_method set globals and print
+# nothing to stdout, so the JSON stays clean.
+#
+# Install to: /usr/lib/cgi-bin/get_gpio_config
+# Requires: lighttpd mod_cgi enabled
+# ============================================
+
+echo "Content-Type: application/json"
+echo ""
+
+CONFIG_FILE="/var/lib/pisowifi/gpio_config"
+
+# Defaults (match gpio-coin-listener: master toggle on when absent)
+GPIO_ENABLED=true
+COIN_PULSE_PIN=7
+COIN_VALUE=1
+PULSE_MODE="falling"
+BOARD_MODEL="auto"
+DEBOUNCE_MS=50
+RELAY_ENABLED=false
+RELAY_PIN=5
+RELAY_INTENSITY=5
+
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+# Board-aware platform state (board_family/model + usable GPIO method)
+if [ -f /usr/local/bin/aircoins-gpio-lib ]; then
+    # shellcheck disable=SC1091
+    source /usr/local/bin/aircoins-gpio-lib
+    detect_board
+    get_gpio_method
+fi
+
+# Canonicalize booleans for the JSON output
+case "${GPIO_ENABLED:-true}" in
+    1|true|TRUE|True|yes|YES|on|ON) GPIO_ENABLED=true ;;
+    *)                              GPIO_ENABLED=false ;;
+esac
+case "${RELAY_ENABLED:-false}" in
+    1|true|TRUE|True|yes|YES|on|ON) RELAY_ENABLED=true ;;
+    *)                              RELAY_ENABLED=false ;;
+esac
+case "${COIN_PULSE_PIN}" in ''|*[!0-9]*) COIN_PULSE_PIN=7 ;; esac
+case "${DEBOUNCE_MS}" in ''|*[!0-9]*) DEBOUNCE_MS=50 ;; esac
+case "${RELAY_PIN}" in ''|*[!0-9]*) RELAY_PIN=5 ;; esac
+case "${RELAY_INTENSITY}" in ''|*[!0-9]*) RELAY_INTENSITY=5 ;; esac
+
+# Unknown/x86 platforms: GPIO_METHOD=none means no SBC GPIO header
+GPIO_AVAILABLE=true
+if [ "$GPIO_METHOD" = "none" ] || [ -z "$GPIO_METHOD" ]; then
+    GPIO_AVAILABLE=false
+fi
+
+# Is the coin listener actually RUNNING right now? This is the ground-truth
+# of "accepted coins" and lets the panel reconcile with reality even when the
+# saved GPIO_ENABLED flag and the live listener have drifted apart.
+LISTENER_ACTIVE=false
+if [ "$(systemctl is-active gpio-coin-listener 2>/dev/null)" = "active" ]; then
+    LISTENER_ACTIVE=true
+elif [ -f /var/run/gpio-coin-listener.pid ]; then
+    _LPID=$(cat /var/run/gpio-coin-listener.pid 2>/dev/null | tr -d '[:space:]')
+    # The CGI runs as www-data, so `kill -0` on the root-owned listener
+    # fails with EPERM even while it is alive — which made the panel show
+    # OFF while coins were being accepted. Read /proc/<pid>/cmdline instead:
+    # it is world-readable and proves the process identity.
+    if [ -n "$_LPID" ] && [ -r "/proc/$_LPID/cmdline" ] && \
+       grep -aq 'gpio-coin-listener' "/proc/$_LPID/cmdline" 2>/dev/null; then
+        LISTENER_ACTIVE=true
+    fi
+fi
+
+echo "{\"status\":\"ok\",\"gpio_enabled\":$GPIO_ENABLED,\"gpio_available\":$GPIO_AVAILABLE,\"listener_active\":$LISTENER_ACTIVE,\"board_family\":\"$BOARD_FAMILY\",\"board_model\":\"$BOARD_MODEL\",\"gpio_method\":\"$GPIO_METHOD\",\"pin\":$COIN_PULSE_PIN,\"coin_value\":${COIN_VALUE:-1},\"pulse_mode\":\"$PULSE_MODE\",\"debounce_ms\":$DEBOUNCE_MS,\"relay_enabled\":$RELAY_ENABLED,\"relay_pin\":$RELAY_PIN,\"relay_intensity\":$RELAY_INTENSITY}"

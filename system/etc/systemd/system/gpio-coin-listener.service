@@ -1,0 +1,23 @@
+[Unit]
+Description=AirCoins - GPIO Coin Listener
+After=network.target aircoins-api.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpio-coin-listener
+# No ExecStop / PIDFile: systemd sends SIGTERM to the main process by
+# default and the script's cleanup trap handles the rest.
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpio-coin-listener
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

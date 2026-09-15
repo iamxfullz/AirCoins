@@ -1,0 +1,8 @@
+[Match]
+Name=end0.*
+
+[Network]
+DHCP=no
+LinkLocalAddressing=ipv6
+ConfigureWithoutCarrier=yes
+KeepConfiguration=yes

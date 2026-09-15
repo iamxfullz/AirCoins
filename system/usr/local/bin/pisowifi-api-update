@@ -1,0 +1,106 @@
+#!/bin/bash
+# ============================================
+# AirCoins - API Status Generator
+# ============================================
+# Generates status.json for the HTML frontend to poll
+# Called by session manager every second
+#
+# Output: /var/www/html/api/status.json
+# ============================================
+
+SESSION_DIR="/var/lib/pisowifi/sessions"
+STATS_FILE="/var/lib/pisowifi/stats"
+GPIO_STATE="/var/lib/pisowifi/gpio_state"
+EVENT_FILE="/var/lib/pisowifi/coin_event"
+OUTPUT_DIR="/var/www/html/api"
+OUTPUT_FILE="$OUTPUT_DIR/status.json"
+
+mkdir -p "$OUTPUT_DIR"
+
+# ============================================
+# GATHER DATA
+# ============================================
+
+# System status
+SYSTEM_ONLINE="true"
+if ! pgrep -x lighttpd > /dev/null 2>&1; then
+    SYSTEM_ONLINE="false"
+fi
+
+# Active sessions
+ACTIVE_SESSIONS=0
+SESSION_JSON=""
+for session_file in "$SESSION_DIR"/*.session; do
+    [ -f "$session_file" ] || continue
+    ACTIVE_SESSIONS=$((ACTIVE_SESSIONS + 1))
+
+    STATUS=$(grep "^STATUS=" "$session_file" | cut -d= -f2)
+    COINS=$(grep "^COINS=" "$session_file" | cut -d= -f2)
+    TOTAL=$(grep "^TOTAL=" "$session_file" | cut -d= -f2)
+    REMAINING=$(grep "^REMAINING=" "$session_file" | cut -d= -f2)
+    STARTED=$(grep "^STARTED=" "$session_file" | cut -d= -f2)
+
+    SESSION_JSON="{\"status\":\"$STATUS\",\"coins\":$COINS,\"total\":$TOTAL,\"remaining\":$REMAINING,\"started\":$STARTED}"
+done
+
+if [ -z "$SESSION_JSON" ]; then
+    SESSION_JSON="null"
+fi
+
+# Stats
+TOTAL_EARNINGS=0
+TOTAL_COINS=0
+TOTAL_SESSIONS=0
+if [ -f "$STATS_FILE" ]; then
+    TOTAL_EARNINGS=$(grep "^total_earnings=" "$STATS_FILE" | cut -d= -f2)
+    TOTAL_COINS=$(grep "^total_coins=" "$STATS_FILE" | cut -d= -f2)
+    TOTAL_SESSIONS=$(grep "^total_sessions=" "$STATS_FILE" | cut -d= -f2)
+fi
+
+# GPIO state
+GPIO_COIN_COUNT=0
+if [ -f "$GPIO_STATE" ]; then
+    GPIO_COIN_COUNT=$(cat "$GPIO_STATE")
+fi
+
+# Last coin event
+LAST_COIN_VALUE=0
+LAST_COIN_TIME=0
+if [ -f "$EVENT_FILE" ]; then
+    EVENT_CONTENT=$(cat "$EVENT_FILE" 2>/dev/null)
+    LAST_COIN_VALUE=$(echo "$EVENT_CONTENT" | awk '{print $1}')
+    LAST_COIN_TIME=$(echo "$EVENT_CONTENT" | awk '{print $2}')
+fi
+
+# Ethernet IP address
+ETH_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -z "$ETH_IP" ] && ETH_IP="0.0.0.0"
+
+# ============================================
+# GENERATE JSON
+# ============================================
+cat > "$OUTPUT_FILE" << EOF
+{
+    "timestamp": $(date +%s),
+    "system": {
+        "online": $SYSTEM_ONLINE,
+        "ip": "$ETH_IP"
+    },
+    "session": $SESSION_JSON,
+    "stats": {
+        "total_earnings": ${TOTAL_EARNINGS:-0},
+        "total_coins": ${TOTAL_COINS:-0},
+        "total_sessions": ${TOTAL_SESSIONS:-0},
+        "active_clients": $ACTIVE_SESSIONS
+    },
+    "gpio": {
+        "coin_count": ${GPIO_COIN_COUNT:-0},
+        "last_coin_value": ${LAST_COIN_VALUE:-0},
+        "last_coin_time": ${LAST_COIN_TIME:-0}
+    }
+}
+EOF
+
+# Set proper permissions
+chown www-data:www-data "$OUTPUT_FILE" 2>/dev/null
+chmod 644 "$OUTPUT_FILE"

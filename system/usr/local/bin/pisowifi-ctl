@@ -1,0 +1,238 @@
+#!/bin/bash
+# ============================================
+# AirCoins PisoWiFi - Service Control Script
+# ============================================
+# Start/stop/restart/status for all AirCoins services
+#
+# Install to: /usr/local/bin/pisowifi-ctl
+# Usage: pisowifi-ctl {start|stop|restart|status|logs}
+# ============================================
+
+# ============================================
+# CONFIGURATION
+# ============================================
+ETH_IFACE="eth0"
+
+# Central interface/network config (overrides the defaults above if present)
+PISOWIFI_CONF="/etc/pisowifi/pisowifi.conf"
+[ -f "$PISOWIFI_CONF" ] && source "$PISOWIFI_CONF"
+
+# Service binaries
+GPIO_LISTENER="/usr/local/bin/gpio-coin-listener"
+SESSION_MGR="/usr/local/bin/pisowifi-session-manager"
+
+# PID files
+GPIO_PID="/var/run/gpio-coin-listener.pid"
+SESSION_PID="/var/run/pisowifi-session.pid"
+
+# Log files
+LOG_DIR="/var/log/pisowifi"
+
+# ============================================
+# COLORS
+# ============================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# ============================================
+# FUNCTIONS
+# ============================================
+
+print_banner() {
+    echo -e "${CYAN}"
+    echo "  ╔══════════════════════════════════════╗"
+    echo "  ║     AirCoins System                  ║"
+    echo "  ║     Orange Pi One Control Panel      ║"
+    echo "  ╚══════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+start_webserver() {
+    echo -n "Starting Web Server (lighttpd)... "
+    systemctl start lighttpd 2>/dev/null
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}[OK]${NC}"
+    else
+        lighttpd -f /etc/lighttpd/lighttpd.conf 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}[OK]${NC} (manual)"
+        else
+            echo -e "${RED}[FAIL]${NC}"
+            return 1
+        fi
+    fi
+}
+
+start_gpio_listener() {
+    echo -n "Starting GPIO Coin Listener... "
+    if [ -f "$GPIO_PID" ] && kill -0 $(cat "$GPIO_PID") 2>/dev/null; then
+        echo -e "${YELLOW}[ALREADY RUNNING]${NC}"
+        return 0
+    fi
+    mkdir -p "$LOG_DIR"
+    $GPIO_LISTENER &
+    sleep 0.5
+    if [ -f "$GPIO_PID" ]; then
+        echo -e "${GREEN}[OK]${NC} (PID: $(cat $GPIO_PID))"
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        return 1
+    fi
+}
+
+start_session_manager() {
+    echo -n "Starting Session Manager... "
+    if [ -f "$SESSION_PID" ] && kill -0 $(cat "$SESSION_PID") 2>/dev/null; then
+        echo -e "${YELLOW}[ALREADY RUNNING]${NC}"
+        return 0
+    fi
+    mkdir -p "$LOG_DIR"
+    mkdir -p /var/lib/pisowifi/sessions
+    $SESSION_MGR &
+    sleep 0.5
+    if [ -f "$SESSION_PID" ]; then
+        echo -e "${GREEN}[OK]${NC} (PID: $(cat $SESSION_PID))"
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        return 1
+    fi
+}
+
+stop_all() {
+    echo -e "${YELLOW}Stopping AirCoins System...${NC}"
+
+    echo -n "Stopping GPIO Coin Listener... "
+    if [ -f "$GPIO_PID" ]; then
+        kill $(cat "$GPIO_PID") 2>/dev/null
+        sleep 0.5
+        echo -e "${GREEN}[STOPPED]${NC}"
+    else
+        echo -e "${YELLOW}[NOT RUNNING]${NC}"
+    fi
+
+    echo -n "Stopping Session Manager... "
+    if [ -f "$SESSION_PID" ]; then
+        kill $(cat "$SESSION_PID") 2>/dev/null
+        sleep 0.5
+        echo -e "${GREEN}[STOPPED]${NC}"
+    else
+        echo -e "${YELLOW}[NOT RUNNING]${NC}"
+    fi
+
+    echo -n "Stopping Web Server... "
+    systemctl stop lighttpd 2>/dev/null || killall lighttpd 2>/dev/null
+    echo -e "${GREEN}[STOPPED]${NC}"
+
+    echo -n "Stopping AirCoins API... "
+    systemctl stop aircoins-api 2>/dev/null || killall aircoins-api 2>/dev/null
+    echo -e "${GREEN}[STOPPED]${NC}"
+}
+
+show_status() {
+    print_banner
+    echo -e "${CYAN}--- Service Status ---${NC}"
+
+    # lighttpd
+    echo -n "  Web Server (lighttpd):  "
+    if pgrep -x lighttpd > /dev/null; then
+        echo -e "${GREEN}RUNNING${NC}"
+    else
+        echo -e "${RED}STOPPED${NC}"
+    fi
+
+    # GPIO listener
+    echo -n "  GPIO Coin Listener:     "
+    if [ -f "$GPIO_PID" ] && kill -0 $(cat "$GPIO_PID") 2>/dev/null; then
+        echo -e "${GREEN}RUNNING${NC} (PID: $(cat $GPIO_PID))"
+    else
+        echo -e "${RED}STOPPED${NC}"
+    fi
+
+    # Session manager
+    echo -n "  Session Manager:        "
+    if [ -f "$SESSION_PID" ] && kill -0 $(cat "$SESSION_PID") 2>/dev/null; then
+        echo -e "${GREEN}RUNNING${NC} (PID: $(cat $SESSION_PID))"
+    else
+        echo -e "${RED}STOPPED${NC}"
+    fi
+
+    # Wi-Fi hotspot (hostapd)
+    echo -n "  Wi-Fi Hotspot (hostapd): "
+    if systemctl is-active --quiet hostapd 2>/dev/null; then
+        echo -e "${GREEN}RUNNING${NC}"
+    else
+        echo -e "${YELLOW}OFF${NC}"
+    fi
+
+    # Active sessions
+    echo ""
+    echo -e "${CYAN}--- Sessions ---${NC}"
+    local active_sessions=$(ls /var/lib/pisowifi/sessions/*.session 2>/dev/null | wc -l)
+    echo "  Active Sessions: $active_sessions"
+
+    # Stats
+    if [ -f /var/lib/pisowifi/stats ]; then
+        echo ""
+        echo -e "${CYAN}--- Statistics ---${NC}"
+        source /var/lib/pisowifi/stats
+        echo "  Total Earnings: ₱${total_earnings:-0}"
+        echo "  Total Coins: ${total_coins:-0}"
+        echo "  Total Sessions: ${total_sessions:-0}"
+    fi
+}
+
+show_logs() {
+    local lines=${1:-50}
+    echo -e "${CYAN}--- Recent Logs (last $lines lines) ---${NC}"
+    echo ""
+    echo -e "${YELLOW}[GPIO Coin Listener]${NC}"
+    tail -n $lines /var/log/pisowifi/gpio-coin.log 2>/dev/null || echo "  No logs yet"
+    echo ""
+    echo -e "${YELLOW}[Session Manager]${NC}"
+    tail -n $lines /var/log/pisowifi/session.log 2>/dev/null || echo "  No logs yet"
+}
+
+# ============================================
+# MAIN
+# ============================================
+case "$1" in
+    start)
+        print_banner
+        echo -e "${GREEN}Starting AirCoins System...${NC}"
+        echo ""
+        start_webserver
+        start_gpio_listener
+        start_session_manager
+        echo ""
+        echo -e "${GREEN}✓ All services started!${NC}"
+        ;;
+    stop)
+        stop_all
+        echo -e "${GREEN}✓ All services stopped.${NC}"
+        ;;
+    restart)
+        stop_all
+        echo ""
+        sleep 1
+        $0 start
+        ;;
+    status)
+        show_status
+        ;;
+    logs)
+        show_logs "${2:-50}"
+        ;;
+    *)
+        print_banner
+        echo "Usage: $0 {start|stop|restart|status|logs}"
+        echo ""
+        echo "  start   - Start all AirCoins services"
+        echo "  stop    - Stop all AirCoins services"
+        echo "  restart - Restart all services"
+        echo "  status  - Show service status"
+        echo "  logs    - Show recent logs (optional: line count)"
+        ;;
+esac

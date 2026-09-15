@@ -1,0 +1,795 @@
+﻿#!/bin/bash
+# ============================================
+# AirCoins GPIO Library â€” board-aware GPIO abstraction
+# ============================================
+# Source this file: source /usr/local/bin/aircoins-gpio-lib
+#
+# PIN NUMBERING
+#   Every public function in this library takes the PHYSICAL HEADER PIN
+#   number (the number printed on the 40-pin header, 1..40) â€” never a
+#   kernel/sunxi/BCM GPIO number. Translation to whatever each backend
+#   wants happens inside this library:
+#     wiringop  -> `gpio -1 ...` (physical numbering)
+#     raspi-gpio-> BCM number
+#     libgpiod  -> gpiochip line number
+#     sysfs     -> global GPIO number (sunxi: bank*32 + line)
+#
+#   Example (Orange Pi PC / Allwinner H3):
+#     physical pin 3 = PA12 = sunxi GPIO 12 = gpiochip0 line 12
+#   Passing "3" to sysfs or gpiod directly would address PA3 â€” a
+#   completely different pin. That is why pin_to_gpio() exists.
+#
+# Provides: detect_board, get_gpio_method, pin_to_gpio, pin_to_label,
+#           pin_conflict_note, gpio_chip_name, gpio_line_busy,
+#           gpio_read, gpio_setup_input, gpio_wait_falling_edge,
+#           gpio_stream_falling_edges, gpio_setup_output, gpio_write,
+#           gpio_test_pin, get_available_pins, get_pin_labels
+# ============================================
+
+# Guard against double-sourcing
+if [ -n "$_AIRCOINS_GPIO_LIB_LOADED" ]; then
+    return 0 2>/dev/null || true
+fi
+_AIRCOINS_GPIO_LIB_LOADED=1
+
+# Global variables set by detect_board / get_gpio_method
+BOARD_FAMILY=""
+BOARD_MODEL=""
+BOARD_CHIPSET=""
+GPIO_PIN_COUNT=0
+GPIO_METHOD=""
+PIN_MAP_TRUSTED=1      # 0 when the header map for this board is unverified
+GPIO_CHIP=""           # resolved lazily by gpio_chip_name()
+GPIOD_MAJOR=""         # libgpiod CLI major version (1 or 2)
+GPIO_BUSY_CONSUMER=""  # set by gpio_line_busy()
+GPIO_BUSY_REASON=""    # set by gpio_line_busy()
+
+CONFIG_FILE="/var/lib/pisowifi/gpio_config"
+
+# ============================================
+# Board Detection
+# ============================================
+detect_board() {
+    local model_raw=""
+
+    # Check if config file has a manual override
+    if [ -f "$CONFIG_FILE" ]; then
+        local cfg_board=""
+        cfg_board=$(grep -E '^BOARD_MODEL=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+        if [ -n "$cfg_board" ] && [ "$cfg_board" != "auto" ]; then
+            model_raw="$cfg_board"
+        fi
+    fi
+
+    # Read from device-tree if no override
+    if [ -z "$model_raw" ]; then
+        if [ -f /proc/device-tree/model ]; then
+            model_raw=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        fi
+    fi
+
+    # Fallback: /etc/armbian-release
+    if [ -z "$model_raw" ] && [ -f /etc/armbian-release ]; then
+        model_raw=$(grep '^BOARD_NAME=' /etc/armbian-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    fi
+
+    # Fallback: /proc/cpuinfo Hardware line
+    if [ -z "$model_raw" ] && [ -f /proc/cpuinfo ]; then
+        model_raw=$(grep -m1 '^Hardware' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^[[:space:]]*//')
+    fi
+
+    BOARD_MODEL="${model_raw:-Unknown}"
+
+    # Determine family and chipset
+    local model_lower
+    model_lower=$(echo "$BOARD_MODEL" | tr '[:upper:]' '[:lower:]')
+
+    if echo "$model_lower" | grep -qi "orange.pi\|orangepi"; then
+        BOARD_FAMILY="orangepi"
+        # Detect chipset
+        if echo "$model_lower" | grep -qi "zero.*2\|zero2"; then
+            BOARD_CHIPSET="H616"
+            GPIO_PIN_COUNT=26
+        elif echo "$model_lower" | grep -qi "5.*plus\|5plus"; then
+            BOARD_CHIPSET="RK3588"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi " 5\|5 "; then
+            BOARD_CHIPSET="RK3588"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "zero.*plus\|zeroplus"; then
+            BOARD_CHIPSET="H5"
+            GPIO_PIN_COUNT=26
+        elif echo "$model_lower" | grep -qi "zero"; then
+            BOARD_CHIPSET="H2+"
+            GPIO_PIN_COUNT=26
+        elif echo "$model_lower" | grep -qi "plus.2e\|plus2e"; then
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "pc.plus\|pcplus"; then
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "pc"; then
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "lite"; then
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "one"; then
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        else
+            BOARD_CHIPSET="H3"
+            GPIO_PIN_COUNT=40
+        fi
+    elif echo "$model_lower" | grep -qi "raspberry.pi\|raspberrypi"; then
+        BOARD_FAMILY="raspberrypi"
+        if echo "$model_lower" | grep -qi " 5\|5 "; then
+            BOARD_CHIPSET="BCM2712"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi " 4\|4 "; then
+            BOARD_CHIPSET="BCM2711"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi " 3\|3 "; then
+            BOARD_CHIPSET="BCM2837"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi " 2\|2 "; then
+            BOARD_CHIPSET="BCM2836"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "zero.*2\|zero2"; then
+            BOARD_CHIPSET="BCM2710A1"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi "zero"; then
+            BOARD_CHIPSET="BCM2835"
+            GPIO_PIN_COUNT=40
+        elif echo "$model_lower" | grep -qi " 1\|model b"; then
+            BOARD_CHIPSET="BCM2835"
+            GPIO_PIN_COUNT=26
+        else
+            BOARD_CHIPSET="BCM2711"
+            GPIO_PIN_COUNT=40
+        fi
+    else
+        BOARD_FAMILY="unknown"
+        BOARD_CHIPSET="unknown"
+        GPIO_PIN_COUNT=40
+    fi
+
+    # Header pin maps below are hand-verified against the schematics for
+    # Allwinner H3/H5 40-pin boards (Orange Pi PC/One/Lite/PC Plus/Plus 2E),
+    # the H2+ Orange Pi Zero 26-pin header, and Raspberry Pi. Anything else
+    # falls back to the H3 40-pin map, which may be wrong â€” flag it so the
+    # listener and the pin test can warn the operator.
+    case "$BOARD_CHIPSET" in
+        H3|H5|H2+|BCM*) PIN_MAP_TRUSTED=1 ;;
+        *)              PIN_MAP_TRUSTED=0 ;;
+    esac
+}
+
+# ============================================
+# GPIO Method Detection
+# ============================================
+get_gpio_method() {
+    if [ "$BOARD_FAMILY" = "orangepi" ] && command -v gpio &>/dev/null; then
+        GPIO_METHOD="wiringop"
+    elif [ "$BOARD_FAMILY" = "raspberrypi" ] && command -v raspi-gpio &>/dev/null; then
+        GPIO_METHOD="raspi-gpio"
+    elif [ "$BOARD_FAMILY" = "raspberrypi" ] && command -v pinctrl &>/dev/null; then
+        GPIO_METHOD="raspi-gpio"
+    elif command -v gpioget &>/dev/null; then
+        GPIO_METHOD="libgpiod"
+    elif [ -d /sys/class/gpio ]; then
+        GPIO_METHOD="sysfs"
+    else
+        GPIO_METHOD="none"
+    fi
+}
+
+# ============================================
+# Pin Translation: PHYSICAL header pin -> kernel GPIO number
+# ============================================
+# Orange Pi (sunxi): returns the global sunxi GPIO number, i.e.
+#   bank*32 + line  (PA=0, PC=64, PD=96, PG=192).
+#   That number is both the sysfs GPIO number and the gpiochip0 line.
+# Raspberry Pi: returns the BCM GPIO number.
+pin_to_gpio() {
+    local pin=$1
+
+    # Unknown boards fall back to the Orange Pi H3 40-pin map (detect_board
+    # sets PIN_MAP_TRUSTED=0 so callers can warn). Never pass a header pin
+    # through untranslated â€” that is exactly how "pin 3" ends up reading PA3.
+    if [ "$BOARD_FAMILY" != "raspberrypi" ]; then
+        if [ "$GPIO_PIN_COUNT" -eq 26 ]; then
+            # Orange Pi Zero / Zero Plus 26-pin header (H2+/H5)
+            case "$pin" in
+                3)  echo 12 ;;   # PA12
+                5)  echo 11 ;;   # PA11
+                7)  echo 6 ;;    # PA6
+                8)  echo 198 ;;  # PG6
+                10) echo 199 ;;  # PG7
+                11) echo 1 ;;    # PA1
+                12) echo 7 ;;    # PA7
+                13) echo 0 ;;    # PA0
+                15) echo 3 ;;    # PA3
+                16) echo 19 ;;   # PA19
+                18) echo 18 ;;   # PA18
+                19) echo 15 ;;   # PA15
+                21) echo 16 ;;   # PA16
+                22) echo 2 ;;    # PA2
+                23) echo 14 ;;   # PA14
+                24) echo 13 ;;   # PA13
+                26) echo 10 ;;   # PA10
+                *)  return 1 ;;
+            esac
+            return 0
+        fi
+
+        # Orange Pi PC / PC Plus / One / Lite / Plus 2E 40-pin header (H3/H5)
+        case "$pin" in
+            3)  echo 12 ;;   # PA12  (TWI0_SDA)
+            5)  echo 11 ;;   # PA11  (TWI0_SCK)
+            7)  echo 6 ;;    # PA6   (PWM1)
+            8)  echo 13 ;;   # PA13  (UART3_TX)
+            10) echo 14 ;;   # PA14  (UART3_RX)
+            11) echo 1 ;;    # PA1   (UART2_RX)
+            12) echo 110 ;;  # PD14  (3*32+14)
+            13) echo 0 ;;    # PA0   (UART2_TX)
+            15) echo 3 ;;    # PA3   (UART2_CTS)
+            16) echo 68 ;;   # PC4   (2*32+4)
+            18) echo 71 ;;   # PC7
+            19) echo 64 ;;   # PC0   (SPI0_MOSI)
+            21) echo 65 ;;   # PC1   (SPI0_MISO)
+            22) echo 2 ;;    # PA2   (UART2_RTS)
+            23) echo 66 ;;   # PC2   (SPI0_CLK)
+            24) echo 67 ;;   # PC3   (SPI0_CS)
+            26) echo 21 ;;   # PA21
+            27) echo 19 ;;   # PA19  (TWI1_SDA)
+            28) echo 18 ;;   # PA18  (TWI1_SCK)
+            29) echo 7 ;;    # PA7
+            31) echo 8 ;;    # PA8
+            32) echo 200 ;;  # PG8   (6*32+8, UART1_RTS)
+            33) echo 9 ;;    # PA9
+            35) echo 10 ;;   # PA10
+            36) echo 201 ;;  # PG9   (UART1_CTS)
+            37) echo 20 ;;   # PA20
+            38) echo 198 ;;  # PG6   (UART1_TX)
+            40) echo 199 ;;  # PG7   (UART1_RX)
+            *)  return 1 ;;
+        esac
+    else
+        # Raspberry Pi BCM mapping (physical pin -> BCM GPIO)
+        case "$pin" in
+            3)  echo 2 ;;
+            5)  echo 3 ;;
+            7)  echo 4 ;;
+            8)  echo 14 ;;
+            10) echo 15 ;;
+            11) echo 17 ;;
+            12) echo 18 ;;
+            13) echo 27 ;;
+            15) echo 22 ;;
+            16) echo 23 ;;
+            18) echo 24 ;;
+            19) echo 10 ;;
+            21) echo 9 ;;
+            22) echo 25 ;;
+            23) echo 11 ;;
+            24) echo 8 ;;
+            26) echo 7 ;;
+            29) echo 5 ;;
+            31) echo 6 ;;
+            32) echo 12 ;;
+            33) echo 13 ;;
+            35) echo 19 ;;
+            36) echo 16 ;;
+            37) echo 26 ;;
+            38) echo 20 ;;
+            40) echo 21 ;;
+            *)  return 1 ;;
+        esac
+    fi
+}
+
+# pin_to_label: PHYSICAL pin -> SoC pad name (PA12, GPIO2, ...)
+pin_to_label() {
+    local pin=$1 gpio_num
+    gpio_num=$(pin_to_gpio "$pin") || return 1
+
+    if [ "$BOARD_FAMILY" != "raspberrypi" ]; then
+        local bank=$((gpio_num / 32)) line=$((gpio_num % 32)) letter
+        case "$bank" in
+            0) letter=A ;; 1) letter=B ;; 2) letter=C ;; 3) letter=D ;;
+            4) letter=E ;; 5) letter=F ;; 6) letter=G ;; 7) letter=H ;;
+            *) echo "GPIO$gpio_num"; return 0 ;;
+        esac
+        echo "P${letter}${line}"
+    else
+        echo "GPIO$gpio_num"
+    fi
+}
+
+# pin_conflict_note: warn about pins whose default alternate function is
+# commonly claimed by a device-tree node / overlay. A claimed line cannot
+# be used as GPIO (gpiod reports "Device or resource busy").
+pin_conflict_note() {
+    local pin=$1
+
+    if [ "$BOARD_FAMILY" != "raspberrypi" ] && [ "$GPIO_PIN_COUNT" -ne 26 ]; then
+        case "$pin" in
+            3|5)         echo "pins 3/5 are TWI0 (i2c-0) SDA/SCK - disable the i2c0 overlay/DT node or use another pin" ;;
+            8|10)        echo "pins 8/10 are UART3 TX/RX - disable uart3 if enabled" ;;
+            19|21|23|24) echo "pins 19/21/23/24 are SPI0 - disable spi0 if enabled" ;;
+            27|28)       echo "pins 27/28 are TWI1 (i2c-1) - disable the i2c1 overlay/DT node" ;;
+            32|36|38|40) echo "pins 32/36/38/40 are UART1 - disable uart1 if enabled" ;;
+        esac
+    elif [ "$BOARD_FAMILY" = "raspberrypi" ]; then
+        case "$pin" in
+            3|5)         echo "pins 3/5 are I2C1 SDA/SCK - disable i2c_arm if enabled" ;;
+            8|10)        echo "pins 8/10 are the primary UART - disable the serial console" ;;
+            19|21|23|24) echo "pins 19/21/23/24 are SPI0 - disable spi if enabled" ;;
+        esac
+    fi
+}
+
+# ============================================
+# libgpiod helpers
+# ============================================
+# gpio_chip_name: gpiochip that owns the header pins.
+gpio_chip_name() {
+    if [ -n "$GPIO_CHIP" ]; then
+        echo "$GPIO_CHIP"
+        return 0
+    fi
+
+    GPIO_CHIP="gpiochip0"
+    if command -v gpiodetect &>/dev/null; then
+        local found
+        # sunxi: "1c20800.pinctrl", RPi: "pinctrl-bcm2711" / "pinctrl-rp1"
+        found=$(gpiodetect 2>/dev/null | grep -i 'pinctrl' | head -1 | awk '{print $1}')
+        [ -n "$found" ] && GPIO_CHIP="$found"
+    fi
+    echo "$GPIO_CHIP"
+}
+
+# gpiod_major: libgpiod CLI major version (1 or 2); tools differ in syntax
+gpiod_major() {
+    if [ -n "$GPIOD_MAJOR" ]; then
+        echo "$GPIOD_MAJOR"
+        return 0
+    fi
+
+    GPIOD_MAJOR=1
+    local ver
+    ver=$(gpioget --version 2>/dev/null | head -1)
+    case "$ver" in
+        *" 2."*|*v2.*) GPIOD_MAJOR=2 ;;
+    esac
+    echo "$GPIOD_MAJOR"
+}
+
+# gpio_line_busy: is the kernel line behind this PHYSICAL pin already
+# claimed by a driver (i2c, spi, uart, another process)?
+#   returns 0 = busy, 1 = free, 2 = cannot determine
+# Sets GPIO_BUSY_CONSUMER and GPIO_BUSY_REASON.
+gpio_line_busy() {
+    local pin=$1 line chip
+    GPIO_BUSY_CONSUMER=""
+    GPIO_BUSY_REASON=""
+
+    line=$(pin_to_gpio "$pin") || return 2
+    chip=$(gpio_chip_name)
+
+    # 1. gpioinfo reports the consumer of every claimed line
+    if command -v gpioinfo &>/dev/null; then
+        local info
+        info=$(gpioinfo "$chip" 2>/dev/null | awk -v l="$line" '$1=="line" && ($2==l":" || $2==l) {print; exit}')
+        if [ -n "$info" ]; then
+            case "$info" in
+                *\[used\]*|*\ used\ *)
+                    GPIO_BUSY_CONSUMER=$(echo "$info" | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+                    [ -n "$GPIO_BUSY_CONSUMER" ] || GPIO_BUSY_CONSUMER="unknown"
+                    GPIO_BUSY_REASON="line $line on $chip is claimed by '$GPIO_BUSY_CONSUMER'"
+                    return 0
+                    ;;
+            esac
+            return 1
+        fi
+    fi
+
+    # 2. No gpioinfo: try to actually grab the line and look for EBUSY
+    if command -v gpioget &>/dev/null; then
+        local err
+        if [ "$(gpiod_major)" = "2" ]; then
+            err=$(gpioget -c "$chip" "$line" 2>&1 >/dev/null)
+        else
+            err=$(gpioget "$chip" "$line" 2>&1 >/dev/null)
+        fi
+        case "$err" in
+            *[Bb]usy*)
+                GPIO_BUSY_CONSUMER="unknown"
+                GPIO_BUSY_REASON="line $line on $chip is busy (device or resource busy)"
+                return 0
+                ;;
+        esac
+        [ -z "$err" ] && return 1
+    fi
+
+    # 3. sysfs: export failure with EBUSY means somebody else owns the line
+    if [ -d /sys/class/gpio ] && [ ! -d "/sys/class/gpio/gpio${line}" ]; then
+        local err
+        err=$(echo "$line" > /sys/class/gpio/export 2>&1)
+        case "$err" in
+            *[Bb]usy*)
+                GPIO_BUSY_CONSUMER="unknown"
+                GPIO_BUSY_REASON="sysfs export of GPIO $line failed: device or resource busy"
+                return 0
+                ;;
+        esac
+        [ -z "$err" ] && return 1
+    fi
+
+    return 2
+}
+
+# ============================================
+# GPIO Operations (all take the PHYSICAL header pin)
+# ============================================
+gpio_read() {
+    local pin=$1 gpio_num chip out
+
+    case "$GPIO_METHOD" in
+        wiringop)
+            # -1 = physical header pin numbering (no translation needed)
+            gpio -1 read "$pin" 2>/dev/null
+            ;;
+        raspi-gpio)
+            gpio_num=$(pin_to_gpio "$pin") || return 1
+            raspi-gpio get "$gpio_num" 2>/dev/null | grep -oP 'level=\K[01]'
+            ;;
+        libgpiod)
+            gpio_num=$(pin_to_gpio "$pin") || return 1
+            # HOT PATH: chip name + CLI major version are cached in
+            # $GPIO_CHIP / $GPIOD_MAJOR (resolved once via
+            # gpio_chip_name/gpiod_major) — never fork gpiodetect or
+            # `gpioget --version` per read.  Those forks made every poll
+            # tens of ms and swallowed fast multi-pulse trains.
+            [ -z "$GPIO_CHIP" ] && gpio_chip_name >/dev/null
+            [ -z "$GPIOD_MAJOR" ] && gpiod_major >/dev/null
+            chip=${GPIO_CHIP:-gpiochip0}
+            if [ "$GPIOD_MAJOR" = "2" ]; then
+                out=$(gpioget --numeric -c "$chip" "$gpio_num" 2>/dev/null) ||
+                    out=$(gpioget -c "$chip" "$gpio_num" 2>/dev/null)
+            case "$out" in
+                *inactive*) echo 0 ;;
+                *active*)   echo 1 ;;
+                *)          echo "$out" | awk '{print $NF}' ;;
+            esac
+            else
+                gpioget "$chip" "$gpio_num" 2>/dev/null
+            fi
+            ;;
+        sysfs)
+            gpio_num=$(pin_to_gpio "$pin") || return 1
+            # Export if needed
+            if [ ! -d "/sys/class/gpio/gpio${gpio_num}" ]; then
+                echo "$gpio_num" > /sys/class/gpio/export 2>/dev/null
+                sleep 0.1
+                echo "in" > "/sys/class/gpio/gpio${gpio_num}/direction" 2>/dev/null
+            fi
+            cat "/sys/class/gpio/gpio${gpio_num}/value" 2>/dev/null
+            ;;
+        *)
+            echo "1"
+            ;;
+    esac
+}
+
+# GPIO output setup + write (relay / light pin).
+# Takes the PHYSICAL header pin number, translates via pin_to_gpio().
+gpio_setup_output() {
+    local pin=$1 gpio_num
+    gpio_num=$(pin_to_gpio "$pin")
+    if [ $? -ne 0 ] || [ -z "$gpio_num" ]; then
+        echo "gpio_setup_output: invalid physical pin $pin" >&2
+        return 1
+    fi
+    case "$GPIO_METHOD" in
+        wiringop)
+            gpio -1 mode "$pin" out 2>/dev/null || gpio mode "$gpio_num" out 2>/dev/null
+            return $?
+            ;;
+        raspi-gpio)
+            command -v raspi-gpio >/dev/null 2>&1 || return 1
+            raspi-gpio set "$gpio_num" op >/dev/null 2>&1
+            return $?
+            ;;
+        libgpiod)
+            return 0
+            ;;
+        sysfs)
+            [ -e "/sys/class/gpio/gpio$gpio_num" ] || echo "$gpio_num" > /sys/class/gpio/export 2>/dev/null
+            echo "out" > "/sys/class/gpio/gpio$gpio_num/direction" 2>/dev/null
+            return $?
+            ;;
+        *)
+            echo "gpio_setup_output: no GPIO interface available" >&2
+            return 1
+            ;;
+    esac
+}
+
+gpio_write() {
+    local pin=$1 val=$2 gpio_num
+    gpio_num=$(pin_to_gpio "$pin")
+    if [ $? -ne 0 ] || [ -z "$gpio_num" ]; then
+        echo "gpio_write: invalid physical pin $pin" >&2
+        return 1
+    fi
+    case "$val" in
+        1|on|high|HIGH) val=1 ;;
+        *) val=0 ;;
+    esac
+    case "$GPIO_METHOD" in
+        wiringop)
+            gpio -1 write "$pin" "$val" 2>/dev/null || gpio write "$gpio_num" "$val" 2>/dev/null
+            return $?
+            ;;
+        raspi-gpio)
+            command -v raspi-gpio >/dev/null 2>&1 || return 1
+            if [ "$val" = "1" ]; then
+                raspi-gpio set "$gpio_num" dh >/dev/null 2>&1
+            else
+                raspi-gpio set "$gpio_num" dl >/dev/null 2>&1
+            fi
+            return $?
+            ;;
+        libgpiod)
+            # libgpiod releases the line when gpioset exits, so a one-shot
+            # set cannot hold a relay ON. Keep a background holder
+            # (gpioset --mode=signal) per write; each new write kills the
+            # previous holder first. PID tracked in /run (tmpfs) with /tmp
+            # fallback for systems without /run/pisowifi.
+            local chip holder_dir holder_pid old_pid
+            chip=$(gpio_chip_name)
+            [ -z "$chip" ] && chip="gpiochip0"
+            command -v gpioset >/dev/null 2>&1 || return 1
+            holder_dir="/run/pisowifi"
+            [ -d "$holder_dir" ] || holder_dir="/tmp"
+            holder_pid="$holder_dir/relay-gpioset-$gpio_num.pid"
+            if [ -f "$holder_pid" ]; then
+                old_pid=$(cat "$holder_pid" 2>/dev/null)
+                if [ -n "$old_pid" ]; then
+                    kill "$old_pid" 2>/dev/null
+                    wait "$old_pid" 2>/dev/null
+                fi
+                rm -f "$holder_pid"
+            fi
+            # Also kill any stray holder for this line (stale pidfile case).
+            pkill -f "gpioset.*$chip.*$gpio_num=" 2>/dev/null
+            if [ "$(gpiod_major)" = "2" ]; then
+                gpioset --mode=signal -c "$chip" "$gpio_num=$val" >/dev/null 2>&1 &
+            else
+                gpioset -m signal "$chip" "$gpio_num=$val" >/dev/null 2>&1 &
+            fi
+            echo $! > "$holder_pid" 2>/dev/null
+            return 0
+            ;;
+        sysfs)
+            echo "$val" > "/sys/class/gpio/gpio$gpio_num/value" 2>/dev/null
+            return $?
+            ;;
+        *)
+            echo "gpio_write: no GPIO interface available" >&2
+            return 1
+            ;;
+    esac
+}
+
+gpio_setup_input() {
+    local pin=$1
+    local pull=${2:-up}
+    local gpio_num
+
+    case "$GPIO_METHOD" in
+        wiringop)
+            # Physical numbering for both calls â€” mixing -1 and -g here is
+            # what silently pointed the listener at the wrong pad before.
+            gpio -1 mode "$pin" in 2>/dev/null
+            if [ "$pull" = "up" ]; then
+                gpio -1 mode "$pin" up 2>/dev/null
+            elif [ "$pull" = "down" ]; then
+                gpio -1 mode "$pin" down 2>/dev/null
+            fi
+            ;;
+        raspi-gpio)
+            gpio_num=$(pin_to_gpio "$pin") || return 1
+            if [ "$pull" = "up" ]; then
+                raspi-gpio set "$gpio_num" ip pu 2>/dev/null
+            elif [ "$pull" = "down" ]; then
+                raspi-gpio set "$gpio_num" ip pd 2>/dev/null
+            else
+                raspi-gpio set "$gpio_num" ip 2>/dev/null
+            fi
+            ;;
+        libgpiod)
+            # libgpiod 1.x CLI cannot set bias; 2.x can, but only for the
+            # duration of a request. The coin acceptor needs an external
+            # pull-up (or WiringOP) when this is the active method.
+            true
+            ;;
+        sysfs)
+            gpio_num=$(pin_to_gpio "$pin") || return 1
+            if [ ! -d "/sys/class/gpio/gpio${gpio_num}" ]; then
+                echo "$gpio_num" > /sys/class/gpio/export 2>/dev/null
+                sleep 0.1
+            fi
+            echo "in" > "/sys/class/gpio/gpio${gpio_num}/direction" 2>/dev/null
+            ;;
+    esac
+}
+
+# gpio_wait_falling_edge <physical pin> <timeout seconds>
+# Blocks (zero CPU) until a falling edge or the timeout elapses.
+#   returns 0 = edge seen, 1 = timeout, 2 = not supported
+gpio_wait_falling_edge() {
+    local pin=$1 timeout_sec=$2 gpio_num chip rc
+
+    command -v gpiomon &>/dev/null || return 2
+    command -v timeout &>/dev/null || return 2
+
+    gpio_num=$(pin_to_gpio "$pin") || return 2
+    chip=$(gpio_chip_name)
+
+    if [ "$(gpiod_major)" = "2" ]; then
+        timeout "$timeout_sec" gpiomon --num-events 1 --edges falling \
+            -c "$chip" "$gpio_num" > /dev/null 2>&1
+    else
+        timeout "$timeout_sec" gpiomon --num-events=1 --falling-edge \
+            "$chip" "$gpio_num" > /dev/null 2>&1
+    fi
+    rc=$?
+
+    case $rc in
+        0)   return 0 ;;   # falling edge seen
+        124) return 1 ;;   # window elapsed (timeout killed gpiomon)
+        *)   return 2 ;;   # gpiomon refused the line (busy / bad syntax)
+    esac
+}
+
+# gpio_stream_falling_edges <physical pin> <seconds>
+# Runs ONE long-lived gpiomon for <seconds> and prints one line to stdout
+# per falling edge (the monitor keeps the line claimed the whole time, so
+# no edge can fall into a restart gap). Blocks until the timeout elapses.
+#   returns 0 = timeout elapsed, 124-style non-zero = gpiomon died early
+#             (line busy / unsupported), 2 = not supported
+gpio_stream_falling_edges() {
+    local pin=$1 seconds=$2 gpio_num chip
+
+    command -v gpiomon &>/dev/null || return 2
+    command -v timeout &>/dev/null || return 2
+
+    gpio_num=$(pin_to_gpio "$pin") || return 2
+    chip=$(gpio_chip_name)
+
+    if [ "$(gpiod_major)" = "2" ]; then
+        timeout "$seconds" gpiomon --edges falling \
+            -c "$chip" "$gpio_num" 2>/dev/null
+    else
+        timeout "$seconds" gpiomon --falling-edge \
+            "$chip" "$gpio_num" 2>/dev/null
+    fi
+}
+
+# gpio_test_pin <physical pin>
+# Prints key=value lines describing the pin (used by the CGI pin test and
+# by the Go API so both report exactly the same thing).
+gpio_test_pin() {
+    local pin=$1 gpio_num label note state busy="unknown"
+
+    gpio_num=$(pin_to_gpio "$pin")
+    if [ $? -ne 0 ] || [ -z "$gpio_num" ]; then
+        echo "pin=$pin"
+        echo "pin_map_trusted=$PIN_MAP_TRUSTED"
+        echo "status=error"
+        echo "message=Invalid physical pin $pin for $BOARD_FAMILY/$BOARD_CHIPSET. Usable physical pins: $(get_available_pins)"
+        return 1
+    fi
+
+    label=$(pin_to_label "$pin")
+    note=$(pin_conflict_note "$pin")
+
+    echo "pin=$pin"
+    echo "gpio=$gpio_num"
+    echo "label=$label"
+    echo "method=$GPIO_METHOD"
+    echo "chip=$(gpio_chip_name)"
+    echo "board_family=$BOARD_FAMILY"
+    echo "board_model=$BOARD_MODEL"
+    echo "board_chipset=$BOARD_CHIPSET"
+    echo "pin_map_trusted=$PIN_MAP_TRUSTED"
+
+    if [ "$GPIO_METHOD" = "none" ]; then
+        echo "status=error"
+        echo "message=No GPIO interface available (install WiringOP, libgpiod or raspi-gpio)"
+        return 1
+    fi
+
+    gpio_line_busy "$pin"
+    case $? in
+        0) busy="yes" ;;
+        1) busy="no" ;;
+        *) busy="unknown" ;;
+    esac
+    echo "busy=$busy"
+    echo "busy_consumer=$GPIO_BUSY_CONSUMER"
+
+    if [ "$busy" = "yes" ]; then
+        echo "status=error"
+        echo "message=Physical pin $pin ($label, $(gpio_chip_name) line $gpio_num) is BUSY: $GPIO_BUSY_REASON. Free it or pick another pin.${note:+ Note: $note}"
+        return 1
+    fi
+
+    gpio_setup_input "$pin" "up"
+    sleep 0.05
+    state=$(gpio_read "$pin")
+    case "$state" in
+        0|1) ;;
+        *)   state="" ;;
+    esac
+
+    if [ -z "$state" ]; then
+        echo "status=error"
+        echo "message=Could not read physical pin $pin ($label, line $gpio_num) via $GPIO_METHOD.${note:+ Note: $note}"
+        return 1
+    fi
+
+    echo "state=$state"
+    echo "status=ok"
+    [ -n "$note" ] && echo "warning=$note"
+    if [ "$PIN_MAP_TRUSTED" != "1" ]; then
+        echo "warning=header pin map for $BOARD_MODEL is unverified - falling back to the Orange Pi H3 40-pin map"
+    fi
+    return 0
+}
+
+# ============================================
+# Pin Listing (physical header pin numbers)
+# ============================================
+get_available_pins() {
+    if [ "$GPIO_PIN_COUNT" -eq 26 ]; then
+        echo "3 5 7 8 10 11 12 13 15 16 18 19 21 22 23 24 26"
+    else
+        echo "3 5 7 8 10 11 12 13 15 16 18 19 21 22 23 24 26 27 28 29 31 32 33 35 36 37 38 40"
+    fi
+}
+
+get_pin_labels() {
+    # Outputs JSON array of {pin, gpio, label, note} for the current board.
+    # "pin" is the PHYSICAL header pin, "gpio" the kernel/sunxi number.
+    local pins
+    pins=$(get_available_pins)
+
+    local first=1
+    echo -n "["
+    for p in $pins; do
+        local gpio_num label note
+        gpio_num=$(pin_to_gpio "$p") || continue
+        label=$(pin_to_label "$p")
+        note=$(pin_conflict_note "$p")
+
+        if [ $first -eq 1 ]; then
+            first=0
+        else
+            echo -n ","
+        fi
+        echo -n "{\"pin\":$p,\"gpio\":$gpio_num,\"label\":\"$label\",\"note\":\"$note\"}"
+    done
+    echo "]"
+}
+
+# ============================================
+# Auto-detect on source if not already set
+# ============================================
+if [ -z "$BOARD_FAMILY" ]; then
+    detect_board
+    get_gpio_method
+fi

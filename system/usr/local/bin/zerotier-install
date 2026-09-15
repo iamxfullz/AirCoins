@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# zerotier-install — Install or uninstall ZeroTier One on an AirCoins device.
+#
+# Usage:
+#   zerotier-install              # install ZeroTier
+#   zerotier-install --uninstall  # remove ZeroTier
+#   zerotier-install --status     # print current state (exit 0 = installed)
+set -euo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+show_status() {
+    if command -v zerotier-cli &>/dev/null; then
+        echo "installed"
+        systemctl is-active zerotier-one 2>/dev/null || echo "service-inactive"
+        zerotier-cli info 2>/dev/null || true
+        exit 0
+    else
+        echo "not-installed"
+        exit 1
+    fi
+}
+
+do_install() {
+    # Must be root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root (use sudo)."
+    fi
+
+    # Already installed?
+    if command -v zerotier-cli &>/dev/null; then
+        info "ZeroTier is already installed."
+        zerotier-cli info 2>/dev/null || true
+        exit 0
+    fi
+
+    info "Updating package index..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq || true
+
+    info "Installing prerequisites (curl, gnupg)..."
+    apt-get install -y -qq curl gnupg lsb-release >/dev/null 2>&1 || true
+
+    info "Running official ZeroTier install script..."
+    curl -s https://install.zerotier.com | bash
+
+    # Verify
+    if ! command -v zerotier-cli &>/dev/null; then
+        error "Installation completed but zerotier-cli was not found. Check network connectivity."
+    fi
+
+    info "Enabling and starting zerotier-one service..."
+    systemctl enable zerotier-one >/dev/null 2>&1 || true
+    systemctl restart zerotier-one
+
+    # Wait for service to be ready
+    sleep 3
+    if systemctl is-active --quiet zerotier-one; then
+        info "ZeroTier service is running."
+    else
+        warn "ZeroTier service may not have started. Check: systemctl status zerotier-one"
+    fi
+
+    info "ZeroTier installed successfully."
+    info "Node address: $(zerotier-cli info 2>/dev/null | awk '{print $3}' || echo 'pending')"
+    info ""
+    info "Next steps:"
+    info "  zerotier-cli join <16-digit-network-id>   # Join a network"
+    info "  zerotier-cli listnetworks                  # List joined networks"
+    info "  Or use the AirCoins admin panel → ZeroTier page."
+}
+
+do_uninstall() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root (use sudo)."
+    fi
+
+    if ! command -v zerotier-cli &>/dev/null; then
+        info "ZeroTier is not installed. Nothing to do."
+        exit 0
+    fi
+
+    info "Stopping zerotier-one service..."
+    systemctl stop zerotier-one 2>/dev/null || true
+    systemctl disable zerotier-one 2>/dev/null || true
+
+    info "Removing ZeroTier packages..."
+    apt-get remove -y -qq zerotier-one 2>/dev/null || true
+    apt-get autoremove -y -qq 2>/dev/null || true
+
+    info "Removing ZeroTier config directory (/var/lib/zerotier-one)..."
+    rm -rf /var/lib/zerotier-one
+
+    if command -v zerotier-cli &>/dev/null; then
+        warn "zerotier-cli still found in PATH; manual cleanup may be needed."
+    else
+        info "ZeroTier has been fully removed."
+    fi
+}
+
+# ── Entry point ────────────────────────────────────────────────────────────
+case "${1:-}" in
+    --status|-s)
+        show_status
+        ;;
+    --uninstall|-u|--remove)
+        do_uninstall
+        ;;
+    --help|-h)
+        echo "Usage: $0 [--uninstall | --status]"
+        echo "  (no args)   Install ZeroTier"
+        echo "  --uninstall Remove ZeroTier completely"
+        echo "  --status    Check if ZeroTier is installed"
+        ;;
+    "")
+        do_install
+        ;;
+    *)
+        error "Unknown option: $1  (use --help for usage)"
+        ;;
+esac

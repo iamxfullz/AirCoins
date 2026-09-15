@@ -1,0 +1,8 @@
+.env
+*.key
+*.pem
+
+# Build artifacts (published to Supabase, not kept in git)
+aircoins-v*.tar.gz
+aircoins-v*.sha256
+patch.exe

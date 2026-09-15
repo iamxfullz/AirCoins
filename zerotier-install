@@ -1,0 +1,733 @@
+#!/bin/bash
+# ============================================
+# AirCoins PisoNet - One-Click Installer
+# ============================================
+# Supports:
+#   - Orange Pi One (ARM) - Full hardware support
+#   - Ubuntu/Debian x86   - Development mode (no GPIO)
+#
+# Wired/VLAN operation with captive portal auto-popup.
+# Run as root: sudo bash install.sh
+# ============================================
+
+set -e
+
+# ============================================
+# CONFIGURATION
+# ============================================
+VERSION="1.29.11"
+INSTALL_DIR="/opt/aircoins"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYSTEM_DIR="$SCRIPT_DIR/system"
+
+# Database settings (defaults match the Go API defaults in
+# system/usr/local/bin/aircoins-api/main.go). Override via environment:
+#   DB_PASSWORD=mysecret sudo -E bash install.sh
+DB_NAME="${DB_NAME:-aircoins}"
+DB_USER="${DB_USER:-aircoins}"
+DB_PASSWORD="${DB_PASSWORD:-aircoins123}"
+
+# Never let apt/dpkg open interactive dialogs during unattended installs
+export DEBIAN_FRONTEND=noninteractive
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ============================================
+# DETECT ARCHITECTURE
+# ============================================
+ARCH=$(uname -m)
+IS_ARM=false
+IS_X86=false
+
+case "$ARCH" in
+    armv7l|aarch64|armhf|arm)
+        IS_ARM=true
+        PLATFORM_NAME="Orange Pi One (ARM)"
+        ;;
+    x86_64|i686|i386)
+        IS_X86=true
+        PLATFORM_NAME="Ubuntu/Debian x86_64"
+        ;;
+    *)
+        echo -e "${RED}Unsupported architecture: $ARCH${NC}"
+        exit 1
+        ;;
+esac
+
+# ============================================
+# CHECK ROOT
+# ============================================
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}ERROR: This script must be run as root!${NC}"
+    echo "Usage: sudo bash install.sh"
+    exit 1
+fi
+
+# ============================================
+# BANNER
+# ============================================
+echo -e "${CYAN}"
+echo "  ╔══════════════════════════════════════════╗"
+echo "  ║       AirCoins PisoNet System v$VERSION     ║"
+echo "  ║       $PLATFORM_NAME Installer  "
+echo "  ╚══════════════════════════════════════════╝"
+echo -e "${NC}"
+
+if [ "$IS_X86" = true ]; then
+    echo -e "${YELLOW}  ⚠ x86 Development Mode${NC}"
+    echo -e "  ${YELLOW}GPIO hardware features disabled.${NC}"
+    echo -e "  ${YELLOW}Use API calls or file-based coin events for testing.${NC}"
+    echo ""
+fi
+
+# ============================================
+# VALIDATE PROJECT STRUCTURE
+# ============================================
+if [ ! -d "$SYSTEM_DIR" ]; then
+    echo -e "${RED}ERROR: Project structure not found!${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Current directory:${NC} $SCRIPT_DIR"
+    echo -e "  ${YELLOW}Expected:${NC} $SYSTEM_DIR"
+    echo ""
+    echo -e "  ${RED}This script must be run from inside the AirCoins project directory.${NC}"
+    echo ""
+    echo -e "  ${CYAN}Fix:${NC}"
+    echo -e "    cd /opt/aircoins         # Navigate to project directory"
+    echo -e "    sudo bash install.sh     # Run installer from there"
+    echo ""
+    exit 1
+fi
+
+if [ ! -d "$SYSTEM_DIR/usr/local/bin/aircoins-api" ]; then
+    echo -e "${RED}ERROR: Go API source not found!${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Missing:${NC} $SYSTEM_DIR/usr/local/bin/aircoins-api"
+    echo ""
+    echo -e "  ${RED}The project may be incomplete. Please clone the full repository:${NC}"
+    echo ""
+    echo -e "    git clone https://github.com/iamxfullz/AirCoins.git /opt/aircoins"
+    echo -e "    cd /opt/aircoins"
+    echo -e "    sudo bash install.sh"
+    echo ""
+    exit 1
+fi
+
+# ============================================
+# STOP EXISTING SERVICES (reinstall safety)
+# ============================================
+# On a reinstall the running aircoins-api binary holds a file lock, which makes
+# the STEP 4 'cp' fail with "Text file busy". Stop everything before copying.
+stop_existing_services() {
+    echo -e "${YELLOW}Stopping existing services...${NC}"
+
+    # Prefer the control script if a previous install left one behind
+    if command -v pisowifi-ctl &> /dev/null; then
+        pisowifi-ctl stop 2>/dev/null || true
+    fi
+
+    # Stop systemd units (ignore errors if a unit does not exist yet)
+    systemctl stop aircoins-api gpio-coin-listener pisowifi-session lighttpd 2>/dev/null || true
+
+    # Kill any leftover processes by name as a fallback
+    pkill -f aircoins-api 2>/dev/null || true
+    pkill -f pisowifi-session 2>/dev/null || true
+    pkill -f gpio-coin-listener 2>/dev/null || true
+
+    # Give processes a moment to release file locks
+    sleep 1
+
+    echo -e "${GREEN}  ✓ Existing services stopped${NC}"
+}
+
+stop_existing_services
+
+# ============================================
+# STEP 1: Update system
+# ============================================
+echo -e "${YELLOW}[1/10]${NC} Updating system packages..."
+apt-get update -qq
+# force-confdef/confold: never stop on a dpkg conffile prompt during upgrade
+apt-get upgrade -y -qq \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold
+echo -e "${GREEN}  ✓ System updated${NC}"
+
+# ============================================
+# STEP 2: Install required packages
+# ============================================
+echo -e "${YELLOW}[2/10]${NC} Installing required packages..."
+
+# Install 'file' first for ELF binary detection
+apt-get install -y -qq file 2>/dev/null || true
+
+# Determine package list (golang-go only if no pre-compiled binary)
+ARM_PACKAGES="lighttpd usbutils wget curl jq bc postgresql postgresql-contrib vlan dnsmasq iptables conntrack"
+X86_PACKAGES="lighttpd wget curl jq bc postgresql postgresql-contrib vlan dnsmasq iptables conntrack"
+
+if [ ! -f "$SYSTEM_DIR/usr/local/bin/aircoins-api/aircoins-api" ] || \
+   ! file "$SYSTEM_DIR/usr/local/bin/aircoins-api/aircoins-api" 2>/dev/null | grep -q "ELF"; then
+    ARM_PACKAGES="$ARM_PACKAGES golang-go"
+    X86_PACKAGES="$X86_PACKAGES golang-go"
+fi
+
+# Install packages
+if [ "$IS_ARM" = true ]; then
+    apt-get install -y -qq $ARM_PACKAGES
+else
+    apt-get install -y -qq $X86_PACKAGES
+fi
+
+echo -e "${GREEN}  ✓ Packages installed${NC}"
+
+# VLAN support
+modprobe 8021q 2>/dev/null || true
+grep -q "^8021q" /etc/modules 2>/dev/null || echo "8021q" >> /etc/modules
+
+# Disable the default dnsmasq service — we use per-interface instances via dnsmasq@.service
+systemctl disable dnsmasq 2>/dev/null || true
+systemctl stop dnsmasq 2>/dev/null || true
+
+# ============================================
+# STEP 3: Setup PostgreSQL Database
+# ============================================
+echo -e "${YELLOW}[3/10]${NC} Setting up PostgreSQL database..."
+
+# Start PostgreSQL
+systemctl start postgresql
+systemctl enable postgresql
+
+# Wait until PostgreSQL accepts connections (a race with service startup
+# would otherwise make the schema/migration steps below fail)
+PG_READY=false
+for _ in $(seq 1 30); do
+    if sudo -u postgres pg_isready -q 2>/dev/null; then
+        PG_READY=true
+        break
+    fi
+    sleep 1
+done
+if [ "$PG_READY" != true ]; then
+    echo -e "${RED}  ✘ FATAL: PostgreSQL did not accept connections within 30s${NC}"
+    echo -e "${RED}    Check: systemctl status postgresql${NC}"
+    exit 1
+fi
+
+# Ensure pg_hba.conf allows password auth over TCP (localhost)
+# This is required so the Go API can connect as $DB_USER via localhost.
+PG_HBA=$(find /etc/postgresql -name pg_hba.conf 2>/dev/null | head -1)
+if [ -n "$PG_HBA" ] && ! grep -q "^host.*${DB_NAME}.*${DB_USER}.*md5" "$PG_HBA" 2>/dev/null; then
+    echo "  Configuring pg_hba.conf for password authentication..."
+    # Add entries before any 'reject' rules so they take precedence
+    sed -i "/^# DO NOT DISABLE/i \\
+# AirCoins: allow password auth for the ${DB_USER} user\nhost    ${DB_NAME}    ${DB_USER}    127.0.0.1/32    md5\nhost    ${DB_NAME}    ${DB_USER}    ::1/128         md5" "$PG_HBA" 2>/dev/null || \
+    echo -e "${YELLOW}  ⚠ Could not auto-edit pg_hba.conf. If the API cannot connect, add manually:${NC}" \
+              "${YELLOW}    host  ${DB_NAME}  ${DB_USER}  127.0.0.1/32  md5${NC}"
+    systemctl reload postgresql
+fi
+
+# All psql calls below go through the postgres superuser via peer auth so
+# they are fully non-interactive — a password prompt can never appear.
+run_pg() { sudo -u postgres psql -v ON_ERROR_STOP=1 "$@"; }
+
+# Create database user (idempotent), then ALWAYS (re)set the password so
+# repeat installs converge on the configured DB_PASSWORD
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | grep -q 1; then
+    run_pg -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';"
+fi
+run_pg -c "ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';"
+
+# Create database if missing, ensure ownership + grants
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | grep -q 1; then
+    run_pg -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+fi
+run_pg -c "ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};"
+run_pg -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
+
+# schema.sql grants table access to the "www-data" role (CGI scripts) —
+# make sure it exists so those GRANTs cannot fail under ON_ERROR_STOP
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='www-data';" | grep -q 1; then
+    run_pg -c 'CREATE ROLE "www-data" WITH LOGIN;'
+fi
+
+# Normalize object ownership (idempotent). On devices where the schema was
+# historically applied directly as the postgres superuser (without SET ROLE),
+# tables in schema public are owned by postgres, so migrations run under
+# SET ROLE $DB_USER fail on ALTER TABLE. Reassign all public tables/sequences/
+# views to $DB_USER. Quoted heredoc keeps $$ and %I literal; the role name is
+# injected via sed and identifier-quoted by format('%I').
+echo "  Normalizing object ownership to ${DB_USER}..."
+OWN_SQL=$(mktemp)
+cat > "$OWN_SQL" << 'OWNEOF'
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER TABLE public.%I OWNER TO %I', r.tablename, '__AIRCOINS_DB_USER__');
+  END LOOP;
+  FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', r.sequencename, '__AIRCOINS_DB_USER__');
+  END LOOP;
+  FOR r IN SELECT viewname FROM pg_views WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER VIEW public.%I OWNER TO %I', r.viewname, '__AIRCOINS_DB_USER__');
+  END LOOP;
+END
+$$;
+OWNEOF
+sed -i "s/__AIRCOINS_DB_USER__/${DB_USER}/g" "$OWN_SQL"
+if ! run_pg -d "$DB_NAME" -f "$OWN_SQL" > /dev/null 2>&1; then
+    echo -e "${YELLOW}  ⚠ Could not normalize object ownership (continuing)${NC}"
+fi
+rm -f "$OWN_SQL"
+
+# Run schema (idempotent — skip if tables already exist).
+# SET ROLE keeps object ownership on $DB_USER even though psql connects as postgres.
+TABLES_EXIST=$(sudo -u postgres psql -d "$DB_NAME" -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='sessions';" 2>/dev/null || echo "0")
+if [ "$TABLES_EXIST" = "1" ]; then
+    echo -e "${GREEN}  ✓ Schema already applied, skipping${NC}"
+else
+    echo "  Applying database schema..."
+    if ! run_pg -d "$DB_NAME" -c "SET ROLE ${DB_USER};" -f "$SYSTEM_DIR/database/schema.sql"; then
+        echo -e "${RED}  ✘ FATAL: Schema import failed!${NC}"
+        echo -e "${RED}    Please check PostgreSQL is running and try manually:${NC}"
+        echo -e "${RED}    sudo -u postgres psql -v ON_ERROR_STOP=1 -d ${DB_NAME} -c 'SET ROLE ${DB_USER};' -f $SYSTEM_DIR/database/schema.sql${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}  ✓ Schema applied successfully${NC}"
+fi
+
+# Run idempotent migrations (safe on both fresh and existing databases).
+# Non-fatal: a failed migration must not abort the whole install.
+if [ -f "$SYSTEM_DIR/database/migrations.sql" ]; then
+    echo "  Applying database migrations..."
+    if run_pg -d "$DB_NAME" -c "SET ROLE ${DB_USER};" -f "$SYSTEM_DIR/database/migrations.sql" > /dev/null; then
+        echo -e "${GREEN}  ✓ Migrations applied${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Migrations failed. Run manually:${NC}"
+        echo -e "${YELLOW}    sudo -u postgres psql -v ON_ERROR_STOP=1 -d ${DB_NAME} -c 'SET ROLE ${DB_USER};' -f $SYSTEM_DIR/database/migrations.sql${NC}"
+    fi
+fi
+
+# Repair default admin credentials if the broken legacy hash is present
+# (the original schema seed hash did not match the documented 'admin123').
+# Only the known-bad hash is replaced — changed passwords are never touched.
+run_pg -d "$DB_NAME" -c "UPDATE admin_users SET password_hash = '\$2a\$10\$PUcBM0XqvzSOG5BmRlxg9.e84jM8uMrnn5eWfYIcrbBhYOCxJ9jaG' WHERE username = 'admin' AND password_hash = '\$2a\$10\$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';" > /dev/null 2>&1 || echo -e "${YELLOW}  ⚠ Could not verify default admin hash (continuing)${NC}"
+
+echo -e "${GREEN}  ✓ PostgreSQL database ready${NC}"
+
+# ============================================
+# STEP 4: Build and Deploy Go API
+# ============================================
+echo -e "${YELLOW}[4/10]${NC} Building Go API server..."
+
+cd "$SYSTEM_DIR/usr/local/bin/aircoins-api"
+
+# Pick the pre-compiled binary matching this machine: ARM devices run
+# 'aircoins-api', x64 Ubuntu boxes run 'aircoins-api-x64' (no GPIO —
+# coinslots come exclusively from NodeMCU Sub-Vendos there).
+PREBUILT="aircoins-api"
+if [ "$IS_X86" = true ] && [ -f "aircoins-api-x64" ] && \
+   file "aircoins-api-x64" 2>/dev/null | grep -q "ELF"; then
+    PREBUILT="aircoins-api-x64"
+    echo "  x86_64 detected — using pre-built x64 binary (Sub-Vendo coinslots only)"
+fi
+
+if [ -f "$SYSTEM_DIR/usr/local/bin/aircoins-api/$PREBUILT" ] && \
+   file "$SYSTEM_DIR/usr/local/bin/aircoins-api/$PREBUILT" 2>/dev/null | grep -q "ELF"; then
+    echo "  ✓ Pre-compiled binary detected, skipping Go build"
+    mkdir -p /usr/local/bin/aircoins-api
+    cp "$SYSTEM_DIR/usr/local/bin/aircoins-api/$PREBUILT" /usr/local/bin/aircoins-api/aircoins-api
+    chmod +x /usr/local/bin/aircoins-api/aircoins-api
+else
+    # Download dependencies
+    go mod tidy
+
+    # Build the binary with version injection
+    BUILD_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "$VERSION")
+    go build -ldflags "-s -w -X main.Version=$BUILD_VERSION" -o aircoins-api .
+
+    # Deploy
+    mkdir -p /usr/local/bin/aircoins-api
+    cp aircoins-api /usr/local/bin/aircoins-api/
+    chmod +x /usr/local/bin/aircoins-api/aircoins-api
+fi
+
+echo -e "${GREEN}  ✓ Go API built and deployed${NC}"
+
+cd "$SCRIPT_DIR"
+
+# ============================================
+# STEP 5: Install GPIO support (board-aware)
+# ============================================
+echo -e "${YELLOW}[5/10]${NC} Installing GPIO support..."
+
+# Detect board for GPIO install decisions
+DETECTED_BOARD=""
+if [ -f /proc/device-tree/model ]; then
+    DETECTED_BOARD=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+fi
+DETECTED_BOARD_LOWER=$(echo "$DETECTED_BOARD" | tr '[:upper:]' '[:lower:]')
+
+if [ "$IS_ARM" = true ]; then
+    # Install gpiod package for libgpiod fallback (both OPi and RPi)
+    apt-get install -y -qq gpiod 2>/dev/null || true
+
+    if echo "$DETECTED_BOARD_LOWER" | grep -qi "raspberry.pi\|raspberrypi"; then
+        # Raspberry Pi: ensure raspi-gpio is available (usually pre-installed)
+        if command -v raspi-gpio &>/dev/null; then
+            echo -e "${GREEN}  ✓ raspi-gpio already available${NC}"
+        else
+            apt-get install -y -qq raspi-gpio 2>/dev/null || true
+            echo -e "${GREEN}  ✓ raspi-gpio installed${NC}"
+        fi
+        echo -e "  ${CYAN}Board: Raspberry Pi — using raspi-gpio${NC}"
+    else
+        # Orange Pi (or other ARM): install WiringOP
+        if command -v gpio &> /dev/null; then
+            echo -e "${GREEN}  ✓ WiringOP already installed${NC}"
+        else
+            # Try to install from Armbian repo first
+            if apt-cache show wiringop &> /dev/null; then
+                apt-get install -y -qq wiringop
+                echo -e "${GREEN}  ✓ WiringOP installed from repo${NC}"
+            else
+                # Manual install from GitHub
+                echo "  Installing WiringOP from source..."
+                cd /tmp
+                if [ ! -d "WiringOP" ]; then
+                    # GIT_TERMINAL_PROMPT=0: never hang on a credentials prompt
+                    GIT_TERMINAL_PROMPT=0 git clone https://github.com/orangepi-xunlong/wiringOP.git 2>/dev/null || {
+                        echo -e "${YELLOW}  ⚠ WiringOP source not available.${NC}"
+                    }
+                fi
+                if [ -d "WiringOP" ]; then
+                    cd WiringOP
+                    ./build
+                    ./build install
+                    cd ..
+                    rm -rf WiringOP
+                    echo -e "${GREEN}  ✓ WiringOP installed from source${NC}"
+                fi
+            fi
+        fi
+        echo -e "  ${CYAN}Board: $DETECTED_BOARD — using WiringOP${NC}"
+    fi
+else
+    echo -e "${YELLOW}  ⚠ x86 platform - GPIO hardware not available${NC}"
+    echo -e "  ${CYAN}GPIO listener will run in file-based test mode.${NC}"
+    echo -e "  ${CYAN}To simulate coin: echo '5' > /var/lib/pisowifi/coin_event${NC}"
+fi
+
+# Deploy shared GPIO library
+cp "$SYSTEM_DIR/usr/local/bin/aircoins-gpio-lib" /usr/local/bin/aircoins-gpio-lib
+chmod +x /usr/local/bin/aircoins-gpio-lib
+echo -e "  ✓ aircoins-gpio-lib deployed"
+
+# ============================================
+# STEP 6: Deploy configuration files
+# ============================================
+echo -e "${YELLOW}[6/10]${NC} Deploying configuration files..."
+
+# lighttpd (always needed)
+cp "$SYSTEM_DIR/etc/lighttpd/lighttpd.conf" /etc/lighttpd/lighttpd.conf
+echo "  ✓ lighttpd.conf"
+
+# Central pisowifi config (do NOT overwrite an existing one on reinstall)
+mkdir -p /etc/pisowifi
+if [ -f /etc/pisowifi/pisowifi.conf ]; then
+    echo "  ✓ pisowifi.conf (kept existing)"
+else
+    cp "$SYSTEM_DIR/etc/pisowifi/pisowifi.conf" /etc/pisowifi/pisowifi.conf
+    echo "  ✓ pisowifi.conf"
+fi
+
+# Captive portal config (do NOT overwrite an existing one on reinstall)
+if [ -f /etc/pisowifi/captive.conf ]; then
+    echo "  ✓ captive.conf (kept existing)"
+else
+    cp "$SYSTEM_DIR/etc/pisowifi/captive.conf" /etc/pisowifi/captive.conf
+    echo "  ✓ captive.conf"
+fi
+
+# Enable IP forwarding so authorized clients can be routed to the uplink
+mkdir -p /etc/sysctl.d
+cp "$SYSTEM_DIR/etc/sysctl.d/99-aircoins.conf" /etc/sysctl.d/99-aircoins.conf
+sysctl -p /etc/sysctl.d/99-aircoins.conf > /dev/null 2>&1 || true
+echo "  ✓ 99-aircoins.conf (ip_forward)"
+
+# Copy .env to /opt/aircoins/.env if present (Supabase credentials for the
+# license system). The systemd unit loads this via EnvironmentFile=.
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    mkdir -p /opt/aircoins
+    if [ "$SCRIPT_DIR" != "/opt/aircoins" ]; then
+        cp "$SCRIPT_DIR/.env" /opt/aircoins/.env
+    fi
+    chown root:root /opt/aircoins/.env
+    chmod 600 /opt/aircoins/.env
+    echo "  ✓ .env → /opt/aircoins/.env (license credentials)"
+elif [ -f "/opt/aircoins/.env" ]; then
+    chown root:root /opt/aircoins/.env
+    chmod 600 /opt/aircoins/.env
+    echo "  ✓ /opt/aircoins/.env preserved (license credentials)"
+else
+    echo -e "  ${YELLOW}⚠ No .env file found. License system requires SUPABASE_URL and SUPABASE_ANON_KEY.${NC}"
+    echo -e "  ${YELLOW}  Create /opt/aircoins/.env with these variables before starting the service.${NC}"
+fi
+
+echo -e "${GREEN}  ✓ Configs deployed${NC}"
+
+# ============================================
+# STEP 7: Deploy web portal files
+# ============================================
+echo -e "${YELLOW}[7/10]${NC} Deploying web portal..."
+
+mkdir -p /var/www/html
+mkdir -p /var/www/html/api
+# Uploaded portal backgrounds live here (admin Portal page). The dir is
+# created but its contents are NEVER touched, so an operator's uploaded
+# background survives reinstalls. The API runs as root so it can write
+# here; www-data ownership (below) lets lighttpd serve the files.
+mkdir -p /var/www/html/portal-assets
+cp "$SCRIPT_DIR/index.html" /var/www/html/index.html
+cp "$SCRIPT_DIR/admin.html" /var/www/html/admin.html
+chown -R www-data:www-data /var/www/html
+chmod -R 755 /var/www/html
+
+# Deploy CGI scripts for admin API
+mkdir -p /usr/lib/cgi-bin
+cp "$SYSTEM_DIR/usr/lib/cgi-bin/set_gpio_config" /usr/lib/cgi-bin/set_gpio_config
+chmod +x /usr/lib/cgi-bin/set_gpio_config
+chown root:www-data /usr/lib/cgi-bin/set_gpio_config
+
+cp "$SYSTEM_DIR/usr/lib/cgi-bin/test_gpio" /usr/lib/cgi-bin/test_gpio
+chmod +x /usr/lib/cgi-bin/test_gpio
+chown root:www-data /usr/lib/cgi-bin/test_gpio
+
+cp "$SYSTEM_DIR/usr/lib/cgi-bin/get_gpio_config" /usr/lib/cgi-bin/get_gpio_config
+chmod +x /usr/lib/cgi-bin/get_gpio_config
+chown root:www-data /usr/lib/cgi-bin/get_gpio_config
+
+# GPIO master toggle platform default:
+#   x86 → OFF (no SBC GPIO header), SBC (ARM) → ON
+# Only sets the key when absent — never overrides an explicit choice.
+mkdir -p /var/lib/pisowifi
+touch /var/lib/pisowifi/gpio_config 2>/dev/null || true
+if ! grep -q '^GPIO_ENABLED=' /var/lib/pisowifi/gpio_config 2>/dev/null; then
+    if [ "$IS_X86" = true ]; then
+        echo "GPIO_ENABLED=false" >> /var/lib/pisowifi/gpio_config
+        echo -e "  GPIO master toggle: ${YELLOW}OFF${NC} (x86 — no SBC GPIO header)"
+    else
+        echo "GPIO_ENABLED=true" >> /var/lib/pisowifi/gpio_config
+        echo -e "  GPIO master toggle: ${GREEN}ON${NC} (SBC board)"
+    fi
+fi
+
+# Enable CGI in lighttpd (fallback if not already in config).
+# Also ensure mod_alias + the /cgi-bin/ -> /usr/lib/cgi-bin/ alias exist;
+# without the alias lighttpd looks under the docroot and the CGI 404s into
+# error-handler, serving index.html instead — silently breaking every admin
+# CGI (GPIO toggle, pin test). This block is idempotent for existing configs.
+if ! grep -q "alias.url += ( \"/cgi-bin/\" => \"/usr/lib/cgi-bin/\" )" /etc/lighttpd/lighttpd.conf 2>/dev/null; then
+    cat >> /etc/lighttpd/lighttpd.conf << 'CGIEOF'
+
+# CGI support + physical dir alias (for admin API — GPIO toggle, pin test)
+server.modules += ( "mod_cgi", "mod_alias" )
+$HTTP["url"] =~ "^/cgi-bin/" {
+    alias.url += ( "/cgi-bin/" => "/usr/lib/cgi-bin/" )
+    cgi.assign = ( "" => "/bin/bash" )
+}
+CGIEOF
+fi
+
+# Validate and load the new config (captive portal redirects live here)
+if lighttpd -t -f /etc/lighttpd/lighttpd.conf > /dev/null 2>&1; then
+    systemctl restart lighttpd 2>/dev/null || true
+    echo "  ✓ lighttpd config valid, service restarted"
+else
+    echo -e "${RED}  ✘ lighttpd config test FAILED — portal will not serve!${NC}"
+    lighttpd -t -f /etc/lighttpd/lighttpd.conf || true
+fi
+
+echo -e "${GREEN}  ✓ Portal deployed to /var/www/html/${NC}"
+
+# ============================================
+# STEP 8: Deploy scripts
+# ============================================
+echo -e "${YELLOW}[8/10]${NC} Deploying scripts..."
+
+# GPIO coin listener
+cp "$SYSTEM_DIR/usr/local/bin/gpio-coin-listener" /usr/local/bin/gpio-coin-listener
+chmod +x /usr/local/bin/gpio-coin-listener
+echo "  ✓ gpio-coin-listener"
+
+# Session manager
+cp "$SYSTEM_DIR/usr/local/bin/pisowifi-session-manager" /usr/local/bin/pisowifi-session-manager
+chmod +x /usr/local/bin/pisowifi-session-manager
+echo "  ✓ pisowifi-session-manager"
+
+# Control script
+cp "$SYSTEM_DIR/usr/local/bin/pisowifi-ctl" /usr/local/bin/pisowifi-ctl
+chmod +x /usr/local/bin/pisowifi-ctl
+echo "  ✓ pisowifi-ctl"
+
+# API status generator
+cp "$SYSTEM_DIR/usr/local/bin/pisowifi-api-update" /usr/local/bin/pisowifi-api-update
+chmod +x /usr/local/bin/pisowifi-api-update
+echo "  ✓ pisowifi-api-update"
+
+# Deploy VLAN + portal server restore script (boot: VLAN ifaces, then
+# enabled portal servers)
+cp "$SYSTEM_DIR/usr/local/bin/aircoins-vlan-apply" /usr/local/bin/
+chmod +x /usr/local/bin/aircoins-vlan-apply
+echo "  ✓ aircoins-vlan-apply"
+
+# Captive portal rules (per-VLAN DNS/HTTP capture + NAT for paid clients)
+cp "$SYSTEM_DIR/usr/local/bin/aircoins-captive-rules" /usr/local/bin/
+chmod +x /usr/local/bin/aircoins-captive-rules
+echo "  ✓ aircoins-captive-rules"
+
+# ZeroTier installer (optional — admin can trigger install from the UI)
+cp "$SYSTEM_DIR/usr/local/bin/zerotier-install" /usr/local/bin/
+chmod +x /usr/local/bin/zerotier-install
+echo "  ✓ zerotier-install"
+
+echo -e "${GREEN}  ✓ All scripts deployed${NC}"
+
+# ============================================
+# STEP 9: Deploy systemd services
+# ============================================
+echo -e "${YELLOW}[9/10]${NC} Deploying systemd services..."
+
+# Create directories
+mkdir -p /var/lib/pisowifi/sessions
+mkdir -p /var/log/pisowifi
+
+# Service files
+cp "$SYSTEM_DIR/etc/systemd/system/aircoins-api.service" /etc/systemd/system/
+cp "$SYSTEM_DIR/etc/systemd/system/aircoins-vlans.service" /etc/systemd/system/
+
+# dnsmasq template service for per-VLAN DHCP
+cp "$SYSTEM_DIR/etc/systemd/system/dnsmasq@.service" /etc/systemd/system/
+mkdir -p /etc/dnsmasq.d
+
+# Prevent systemd-networkd from managing VLAN sub-interfaces (no DHCP on end0.*)
+mkdir -p /etc/systemd/network
+cp "$SYSTEM_DIR/etc/systemd/network/05-aircoins-vlans.network" /etc/systemd/network/
+networkctl reload 2>/dev/null || true
+
+if [ "$IS_ARM" = true ]; then
+    cp "$SYSTEM_DIR/etc/systemd/system/gpio-coin-listener.service" /etc/systemd/system/
+    cp "$SYSTEM_DIR/etc/systemd/system/pisowifi-session.service" /etc/systemd/system/
+else
+    # x86: Deploy services but GPIO listener uses test mode
+    cp "$SYSTEM_DIR/etc/systemd/system/gpio-coin-listener.service" /etc/systemd/system/
+    cp "$SYSTEM_DIR/etc/systemd/system/pisowifi-session.service" /etc/systemd/system/
+fi
+
+# Reload systemd
+systemctl daemon-reload
+
+# Enable services on boot
+systemctl enable aircoins-api.service
+systemctl enable gpio-coin-listener.service
+systemctl enable pisowifi-session.service
+systemctl enable aircoins-vlans.service
+
+echo -e "${GREEN}  ✓ Services deployed and enabled${NC}"
+
+# ============================================
+# STEP 10: Configure system
+# ============================================
+echo -e "${YELLOW}[10/10]${NC} Configuring system..."
+
+# Set permissions
+chmod 755 /var/lib/pisowifi
+chmod 755 /var/log/pisowifi
+
+# Create network config files if not exists.
+# VLANs carry network identity only; the hotspot stack (portal IP, DHCP,
+# DNS hijack, captive rules) is provisioned per interface via portals.conf.
+mkdir -p /etc/pisowifi
+if [ ! -f /etc/pisowifi/vlans.conf ]; then
+    echo "# AirCoins VLAN Configuration" > /etc/pisowifi/vlans.conf
+    echo "# Format: interface vlan_id description" >> /etc/pisowifi/vlans.conf
+fi
+if [ ! -f /etc/pisowifi/portals.conf ]; then
+    echo "# AirCoins Portal Server Configuration" > /etc/pisowifi/portals.conf
+    echo "# Format: interface ip/cidr dhcp_start dhcp_end lease enabled|disabled" >> /etc/pisowifi/portals.conf
+fi
+
+# Bridge configuration
+if [ ! -f /etc/pisowifi/bridges.conf ]; then
+    cat > /etc/pisowifi/bridges.conf << 'EOF'
+# AirCoins Bridge Configuration
+# Format: bridge_name description member1 member2 ...
+# Example: br0 Main portal bridge end0.22 end0.23
+EOF
+    echo "  Created /etc/pisowifi/bridges.conf"
+fi
+
+echo -e "${GREEN}  ✓ System configured${NC}"
+
+# ============================================
+# DONE
+# ============================================
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║     Installation Complete!               ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
+echo ""
+
+if [ "$IS_ARM" = true ]; then
+    echo -e "  ${CYAN}Admin Panel:${NC}  http://$(hostname -I 2>/dev/null | awk '{print $1}')/admin.html"
+    echo -e "  ${CYAN}Login:${NC}        admin / admin123"
+    echo ""
+    echo -e "  ${YELLOW}GPIO Wiring:${NC}"
+    echo -e "    Coin Acceptor Pulse → Physical Pin 7 (PA6)"
+    echo -e "    Coin Acceptor GND   → Orange Pi GND"
+else
+    echo -e "  ${CYAN}Portal URL:${NC}  http://localhost"
+    echo -e "  ${CYAN}Admin URL:${NC}   http://localhost/admin.html"
+    echo -e "  ${CYAN}API URL:${NC}     http://localhost:8080/api/"
+    echo -e "  ${CYAN}Login:${NC}       admin / admin123"
+    echo ""
+    echo -e "  ${YELLOW}Testing (x86 mode):${NC}"
+    echo -e "    Simulate coin:    echo '5' > /var/lib/pisowifi/coin_event"
+    echo -e "    Or use API:       curl -X POST http://localhost:8080/api/gpio/coin \\"
+    echo -e "                        -H 'Content-Type: application/json' \\"
+    echo -e "                        -d '{\"coin_value\": 5}'"
+fi
+
+echo ""
+echo -e "  ${YELLOW}Commands:${NC}"
+echo -e "    pisowifi-ctl start    ${NC}- Start all services"
+echo -e "    pisowifi-ctl stop     ${NC}- Stop all services"
+echo -e "    pisowifi-ctl restart  ${NC}- Restart all services"
+echo -e "    pisowifi-ctl status   ${NC}- Show status"
+echo -e "    pisowifi-ctl logs     ${NC}- View logs"
+echo ""
+echo -e "  ${YELLOW}To start now:${NC} sudo pisowifi-ctl start"
+echo ""
+echo -e "  ${RED}NOTE: A reboot is recommended before first use.${NC}"
+echo -e "  ${RED}      sudo reboot${NC}"
+echo ""
+
+# Ask to start now (only when running interactively — never block an
+# unattended install; default is No)
+start_now="n"
+if [ -t 0 ]; then
+    read -p "Start AirCoins now? [y/N]: " start_now || true
+fi
+if [[ "$start_now" =~ ^[Yy]$ ]]; then
+    echo ""
+    pisowifi-ctl start
+fi
+
+
+
+
+

@@ -1,0 +1,22 @@
+[Unit]
+Description=AirCoins - Session Manager
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pisowifi-session-manager
+# No ExecStop / PIDFile: systemd's default SIGTERM handling stops the script.
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pisowifi-session
+
+# Needs root for firewall/session management
+NoNewPrivileges=no
+ProtectSystem=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,705 @@
+#!/bin/bash
+# ============================================
+# AirCoins - Captive Portal Rules
+# ============================================
+# Per-VLAN captive portal capture (DNS + HTTP
+# redirect to the portal) plus NAT/forwarding
+# for authorized (paying) clients.
+#
+# Install to: /usr/local/bin/aircoins-captive-rules
+#
+# Usage:
+#   aircoins-captive-rules add    <iface> <gateway> [anti_hotspot]
+#   aircoins-captive-rules del    <iface> <gateway> [anti_hotspot]
+#   aircoins-captive-rules auth   <mac>
+#   aircoins-captive-rules unauth <mac>
+#   aircoins-captive-rules status
+#
+# Rule layout (both chains are shared by all VLANs):
+#
+#   nat AIRCOINS_CAPTIVE   (hooked first in nat PREROUTING)
+#     [top]  authorized clients: DNS -> real upstream, then RETURN
+#     [tail] per-VLAN: DNS -> gateway dnsmasq, HTTP -> gateway portal
+#
+#   filter AIRCOINS_FORWARD  (hooked first in filter FORWARD)
+#     [top]  authorized clients: ACCEPT
+#     [tail] per-VLAN: return traffic ACCEPT, everything else DROP
+#
+# Authorized-client rules always sit ABOVE the captive
+# rules, so paying clients bypass the portal capture.
+# ============================================
+
+set -u
+
+# ============================================
+# CONFIGURATION
+# ============================================
+# Upstream resolver handed to authorized clients (their port 53
+# traffic is DNAT'ed here, bypassing the wildcard portal hijack).
+#
+# Auto-detected from the gateway's own resolver so it works on any
+# ISP (many Philippine ISPs block/reject external resolvers like
+# 8.8.8.8, which leaves authorized clients with dead DNS). A manual
+# UPSTREAM_DNS in /etc/pisowifi/captive.conf always wins.
+#
+# ISP routers (192.168.1.1, 192.168.254.254, etc.) usually act as DNS
+# servers, so we try the default gateway as DNS if nothing else works.
+detect_upstream_dns() {
+    local d=""
+    # 1) systemd-resolved per-link servers (skips the 127.0.0.53 stub)
+    if command -v resolvectl >/dev/null 2>&1; then
+        d=$(resolvectl dns 2>/dev/null \
+            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+            | grep -v '^127\.' | head -1)
+        [ -n "$d" ] && { echo "$d"; return; }
+    fi
+    # 2) the real upstream file behind the stub resolver
+    if [ -f /run/systemd/resolve/resolv.conf ]; then
+        d=$(awk '/^nameserver/ && $2 !~ /^127\./ {print $2; exit}' \
+            /run/systemd/resolve/resolv.conf)
+        [ -n "$d" ] && { echo "$d"; return; }
+    fi
+    # 3) plain /etc/resolv.conf (ignore loopback stubs)
+    d=$(awk '/^nameserver/ && $2 !~ /^127\./ {print $2; exit}' /etc/resolv.conf)
+    [ -n "$d" ] && { echo "$d"; return; }
+    # 4) Try the default gateway as DNS (ISP routers usually act as DNS)
+    d=$(ip route show default 2>/dev/null | awk '/default via {print $3}' | head -1)
+    if [ -n "$d" ] && [ "$d" != "127.0.0.1" ] && [ "$d" != "127.0.0.53" ]; then
+        echo "$d"
+        return
+    fi
+    # 5) last resort
+    echo "8.8.8.8"
+}
+UPSTREAM_DNS=$(detect_upstream_dns)
+
+# Leave empty to auto-detect the uplink from the default route.
+WAN_IFACE=""
+
+CAPTIVE_CONF="/etc/pisowifi/captive.conf"
+# shellcheck source=/dev/null
+[ -f "$CAPTIVE_CONF" ] && source "$CAPTIVE_CONF"
+
+NAT_CHAIN="AIRCOINS_CAPTIVE"
+FWD_CHAIN="AIRCOINS_FORWARD"
+STATE_DIR="/var/lib/pisowifi/captive"
+# File to track authorized MACs for DNS refresh on ISP change
+AUTH_MACS_FILE="$STATE_DIR/authorized_macs"
+
+# ============================================
+# CLEAN DNS FORWARDER (port 5353)
+# ============================================
+# Authorized clients' DNS is REDIRECTed to this local forwarder instead of
+# being DNAT'ed to the ISP's DNS server. The forwarder is a second dnsmasq
+# instance with NO captive hijack and NO DHCP — it simply forwards queries
+# upstream using /etc/resolv.conf, which DHCP/systemd-resolved updates
+# automatically when the ISP changes. This makes the per-MAC firewall rules
+# ISP-INDEPENDENT: they point at the SBC itself (REDIRECT), never at an
+# address that goes stale when the unit is moved to another ISP.
+FORWARDER_PORT=5353
+FORWARDER_CONF="/etc/dnsmasq-aircoins-forwarder.conf"
+FORWARDER_UNIT="/etc/systemd/system/aircoins-dns-forwarder.service"
+
+ensure_dns_forwarder() {
+    if ! command -v dnsmasq >/dev/null 2>&1; then
+        log "dns forwarder: dnsmasq not found, cannot start clean forwarder"
+        return 1
+    fi
+    if [ ! -f "$FORWARDER_CONF" ]; then
+        cat > "$FORWARDER_CONF" <<EOF
+# AirCoins clean DNS forwarder for authorized captive clients.
+# Forward-only resolver: NO captive hijack, NO wildcard answers, NO DHCP.
+# Upstream servers follow /etc/resolv.conf (updated automatically by
+# DHCP / systemd-resolved when the ISP changes). Managed by
+# aircoins-captive-rules — do not edit by hand.
+port=$FORWARDER_PORT
+listen-address=0.0.0.0
+bind-interfaces
+no-hosts
+no-dhcp-interface=*
+cache-size=1000
+log-facility=/var/log/aircoins-dns-forwarder.log
+EOF
+    fi
+    if [ ! -f "$FORWARDER_UNIT" ]; then
+        cat > "$FORWARDER_UNIT" <<EOF
+[Unit]
+Description=AirCoins clean DNS forwarder (authorized clients)
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=$FORWARDER_CONF
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+    systemctl enable aircoins-dns-forwarder >/dev/null 2>&1
+    if ! systemctl is-active --quiet aircoins-dns-forwarder; then
+        systemctl start aircoins-dns-forwarder
+    fi
+    log "dns forwarder: listening on port $FORWARDER_PORT"
+}
+
+# Port of the AirCoins Go API. Authorized clients' cached captive probes
+# (still addressed to the gateway IP) are REDIRECTed here so the API's
+# ProbeRelease handler can answer them with the exact success content each
+# OS expects. Must match the API listen port (systemd: PORT, default 8080).
+API_PORT="${AIRCOINS_API_PORT:-8080}"
+
+# Probe paths mirrored from lighttpd.conf's captive redirect list and the
+# Go ProbeRelease handler. Keep all three in sync.
+PROBE_PATHS=(
+    "/hotspot-detect.html"
+    "/library/test/success.html"
+    "/canonical.html"
+    "/generate_204"
+    "/gen_204"
+    "/generate204"
+    "/mobile/status.php"
+    "/connecttest.txt"
+    "/ncsi.txt"
+    "/success.txt"
+    "/nm-check.txt"
+    "/check_network_status.txt"
+    "/kindle-wifi/wifistub.html"
+)
+
+# ============================================
+# LOGGING
+# ============================================
+log() {
+    logger -t aircoins-captive "$1" 2>/dev/null
+    echo "$1"
+}
+
+die() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+# ============================================
+# VALIDATION
+# ============================================
+valid_iface() {
+    case "$1" in
+        ""|lo|*/*|*..*) return 1 ;;
+    esac
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+valid_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS=. octet
+    for octet in $1; do
+        [ "$octet" -le 255 ] || return 1
+    done
+    return 0
+}
+
+valid_mac() {
+    [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+# ============================================
+# IDEMPOTENT iptables HELPERS
+# ============================================
+# All mutations check with -C first so repeated calls are safe.
+
+# ensure_chain <table> <chain>
+ensure_chain() {
+    iptables -t "$1" -S "$2" >/dev/null 2>&1 || iptables -t "$1" -N "$2"
+}
+
+# ensure_hook <table> <parent-chain> <target-chain>
+# Hooks target as the FIRST rule of the parent chain.
+ensure_hook() {
+    if ! iptables -t "$1" -C "$2" -j "$3" 2>/dev/null; then
+        iptables -t "$1" -I "$2" 1 -j "$3"
+    fi
+}
+
+# append_rule <table> <chain> <rule...>
+append_rule() {
+    local table="$1"; shift
+    if ! iptables -t "$table" -C "$@" 2>/dev/null; then
+        iptables -t "$table" -A "$@"
+    fi
+}
+
+# insert_rule <table> <chain> <rule...>  (at position 1)
+insert_rule() {
+    local table="$1" chain="$2"; shift 2
+    if ! iptables -t "$table" -C "$chain" "$@" 2>/dev/null; then
+        iptables -t "$table" -I "$chain" 1 "$@"
+    fi
+}
+
+# delete_rule <table> <chain> <rule...>  (removes every duplicate)
+delete_rule() {
+    local table="$1"; shift
+    while iptables -t "$table" -C "$@" 2>/dev/null; do
+        iptables -t "$table" -D "$@" 2>/dev/null || break
+    done
+}
+
+# ============================================
+# NETWORK HELPERS
+# ============================================
+detect_wan() {
+    if [ -n "$WAN_IFACE" ]; then
+        echo "$WAN_IFACE"
+        return
+    fi
+    ip route show default 2>/dev/null |
+        awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+
+# iface_cidr <iface> -> "10.0.22.1/24"
+iface_cidr() {
+    ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4; exit}'
+}
+
+# cidr_to_network <ip/prefix> -> "10.0.22.0/24"
+cidr_to_network() {
+    local ipcidr="$1" ip prefix
+    ip="${ipcidr%%/*}"
+    prefix="${ipcidr#*/}"
+    if [ "$prefix" = "$ipcidr" ] || [ -z "$prefix" ]; then
+        prefix=24
+    fi
+    [ "$prefix" -ge 0 ] 2>/dev/null && [ "$prefix" -le 32 ] || prefix=24
+    valid_ip "$ip" || return 1
+
+    local IFS=. o1 o2 o3 o4
+    read -r o1 o2 o3 o4 <<< "$ip"
+    local value=$(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 ))
+    local mask=0
+    if [ "$prefix" -gt 0 ]; then
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    local net=$(( value & mask ))
+    echo "$(( (net >> 24) & 255 )).$(( (net >> 16) & 255 )).$(( (net >> 8) & 255 )).$(( net & 255 ))/$prefix"
+}
+
+# Resolve the subnet for an iface, remembering it so `del` still
+# works after the VLAN interface has already been torn down.
+subnet_for() {
+    local iface="$1" cidr subnet
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    local cache="$STATE_DIR/${iface}.subnet"
+
+    cidr=$(iface_cidr "$iface")
+    if [ -n "$cidr" ]; then
+        subnet=$(cidr_to_network "$cidr") && [ -n "$subnet" ] && {
+            echo "$subnet" > "$cache" 2>/dev/null
+            echo "$subnet"
+            return 0
+        }
+    fi
+
+    if [ -f "$cache" ]; then
+        cat "$cache"
+        return 0
+    fi
+    return 1
+}
+
+enable_forwarding() {
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    fi
+}
+
+# NOTE: Anti-hotspot (TTL=1) is handled entirely by the Go API binary
+# via direct iptables mangle commands. This script does NOT touch the
+# mangle table or anti-hotspot state. This avoids conflicts between
+# the shell script and the Go binary.
+
+# ============================================
+# CAPTIVE RULES - ADD
+# ============================================
+cmd_add() {
+    local iface="$1" gateway="$2"
+    valid_iface "$iface" || die "invalid interface: $iface"
+    valid_ip "$gateway" || die "invalid gateway: $gateway"
+
+    enable_forwarding
+    ensure_chain nat "$NAT_CHAIN"
+    ensure_chain filter "$FWD_CHAIN"
+    ensure_hook nat PREROUTING "$NAT_CHAIN"
+    ensure_hook filter FORWARD "$FWD_CHAIN"
+
+    # --- Capture: send all DNS to the local dnsmasq for this VLAN.
+    append_rule nat "$NAT_CHAIN" -i "$iface" -p udp --dport 53 \
+        -j DNAT --to-destination "$gateway:53"
+    append_rule nat "$NAT_CHAIN" -i "$iface" -p tcp --dport 53 \
+        -j DNAT --to-destination "$gateway:53"
+
+    # --- Capture: force all HTTP to the portal.
+    append_rule nat "$NAT_CHAIN" -i "$iface" -p tcp --dport 80 \
+        -j DNAT --to-destination "$gateway:80"
+
+    # --- Portal/DHCP/DNS access to the gateway itself.
+    append_rule filter INPUT -i "$iface" -p udp --dport 67:68 -j ACCEPT
+    append_rule filter INPUT -i "$iface" -p udp --dport 53 -j ACCEPT
+    append_rule filter INPUT -i "$iface" -p tcp --dport 53 -j ACCEPT
+    append_rule filter INPUT -i "$iface" -p tcp --dport 80 -j ACCEPT
+
+    # --- Forwarding: return traffic is fine, anything else from an
+    # unauthorized client is dropped (authorized MACs ACCEPT above).
+    append_rule filter "$FWD_CHAIN" -o "$iface" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    append_rule filter "$FWD_CHAIN" -i "$iface" -j DROP
+
+    # --- NAT for authorized clients reaching the internet.
+    local subnet wan
+    subnet=$(subnet_for "$iface")
+    wan=$(detect_wan)
+    if [ -n "$subnet" ] && [ -n "$wan" ] && [ "$wan" != "$iface" ]; then
+        append_rule nat POSTROUTING -s "$subnet" -o "$wan" -j MASQUERADE
+        log "captive rules added for $iface (gw $gateway, nat $subnet -> $wan)"
+    else
+        log "captive rules added for $iface (gw $gateway, MASQUERADE skipped: no uplink)"
+    fi
+}
+
+# ============================================
+# CAPTIVE RULES - DEL
+# ============================================
+cmd_del() {
+    local iface="$1" gateway="$2"
+    valid_iface "$iface" || die "invalid interface: $iface"
+    valid_ip "$gateway" || die "invalid gateway: $gateway"
+
+    local subnet wan
+    subnet=$(subnet_for "$iface")
+    wan=$(detect_wan)
+    if [ -n "$subnet" ] && [ -n "$wan" ]; then
+        delete_rule nat POSTROUTING -s "$subnet" -o "$wan" -j MASQUERADE
+    fi
+
+    delete_rule nat "$NAT_CHAIN" -i "$iface" -p udp --dport 53 \
+        -j DNAT --to-destination "$gateway:53"
+    delete_rule nat "$NAT_CHAIN" -i "$iface" -p tcp --dport 53 \
+        -j DNAT --to-destination "$gateway:53"
+    delete_rule nat "$NAT_CHAIN" -i "$iface" -p tcp --dport 80 \
+        -j DNAT --to-destination "$gateway:80"
+
+    delete_rule filter INPUT -i "$iface" -p udp --dport 67:68 -j ACCEPT
+    delete_rule filter INPUT -i "$iface" -p udp --dport 53 -j ACCEPT
+    delete_rule filter INPUT -i "$iface" -p tcp --dport 53 -j ACCEPT
+    delete_rule filter INPUT -i "$iface" -p tcp --dport 80 -j ACCEPT
+
+    delete_rule filter "$FWD_CHAIN" -o "$iface" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    delete_rule filter "$FWD_CHAIN" -i "$iface" -j DROP
+
+    rm -f "$STATE_DIR/${iface}.subnet" 2>/dev/null
+
+    log "captive rules removed for $iface"
+}
+
+# ============================================
+# CLIENT AUTHORIZATION
+# ============================================
+# Drop the conntrack entries for one client only, so a state change takes
+# effect immediately instead of riding already-established (and already
+# DNAT'ed) connections. Scoped by the client's current IP from the neighbour
+# table — never flush the whole table, that would cut off every other client.
+flush_client_conntrack() {
+    local mac="$1" ip
+    command -v conntrack >/dev/null 2>&1 || return 0
+
+    for ip in $(ip neigh show 2>/dev/null |
+        awk -v m="$mac" 'tolower($0) ~ tolower(m) {print $1}'); do
+        valid_ip "$ip" || continue
+        conntrack -D --src "$ip" >/dev/null 2>&1
+        conntrack -D --dst "$ip" >/dev/null 2>&1
+    done
+    return 0
+}
+
+# Removes the whitelist rules for a MAC (used by both unauth and
+# auth, so re-authorizing cannot leave rules in the wrong order).
+#
+# Rules are deleted by MAC pattern, NOT by exact rule spec: the DNAT
+# destination embedded in the DNS rules depends on UPSTREAM_DNS at the
+# time of auth, and that value can change between auth and unauth
+# (captive.conf edits, resolver auto-detect results). Exact-spec deletes
+# would silently miss stale variants and leave orphan rules that divert
+# the client's DNS to a dead resolver forever — no popup, no internet.
+remove_auth_rules() {
+    local mac="$1" line
+    while :; do
+        line=$(iptables -t nat -S "$NAT_CHAIN" 2>/dev/null |
+            grep -- "--mac-source $mac" | tail -1)
+        [ -z "$line" ] && break
+        eval "iptables -t nat -D $NAT_CHAIN ${line#-A $NAT_CHAIN }" 2>/dev/null || break
+    done
+    while :; do
+        line=$(iptables -S "$FWD_CHAIN" 2>/dev/null |
+            grep -- "--mac-source $mac" | tail -1)
+        [ -z "$line" ] && break
+        eval "iptables -D $FWD_CHAIN ${line#-A $FWD_CHAIN }" 2>/dev/null || break
+    done
+}
+
+cmd_auth() {
+    local mac="$1"
+    valid_mac "$mac" || die "invalid MAC address: $mac"
+
+    ensure_chain nat "$NAT_CHAIN"
+    ensure_chain filter "$FWD_CHAIN"
+    ensure_hook nat PREROUTING "$NAT_CHAIN"
+    ensure_hook filter FORWARD "$FWD_CHAIN"
+    enable_forwarding
+
+    # Rebuild from scratch so the rules land in a known order.
+    remove_auth_rules "$mac"
+
+    # Inserted at position 1 each time, so the resulting top-down
+    # order is: udp/53 -> upstream, tcp/53 -> upstream,
+    # probe release (x N), RETURN.
+    insert_rule nat "$NAT_CHAIN" -m mac --mac-source "$mac" -j RETURN
+
+    # --- Probe release ---------------------------------------------
+    # iOS caches the hijacked DNS answer (captive.apple.com -> gateway
+    # IP) while captive and keeps re-probing that IP AFTER payment.
+    # Without an intercept, those probes land on lighttpd and get 302'd
+    # back to the portal, so the iPhone never drops its captive state
+    # (Android re-resolves DNS and escapes on its own). Redirect probe
+    # requests still aimed at a LOCAL address to the Go API, which
+    # answers with the exact success content each OS expects. The path
+    # is matched WITHOUT a "GET " prefix because some clients send
+    # absolute-form request lines (GET http://host/path). The MAC +
+    # LOCAL-dst + port-80 constraints make a stray match impossible in
+    # practice. Real-internet destinations (addrtype not LOCAL) fall
+    # through to RETURN and are forwarded normally.
+    local p
+    for p in "${PROBE_PATHS[@]}"; do
+        insert_rule nat "$NAT_CHAIN" -p tcp --dport 80 -m mac --mac-source "$mac" \
+            -m addrtype --dst-type LOCAL -m string --algo bm \
+            --string "$p" -j REDIRECT --to-ports "$API_PORT"
+    done
+
+    # DNS: REDIRECT to the SBC's own clean forwarder (port 5353). REDIRECT
+    # resolves to the incoming interface's local address, so NO IP is
+    # embedded in the rule — the rule can never go stale when the ISP
+    # changes. The forwarder's upstream follows /etc/resolv.conf.
+    insert_rule nat "$NAT_CHAIN" -p tcp --dport 53 -m mac --mac-source "$mac" \
+        -j REDIRECT --to-ports "$FORWARDER_PORT"
+    insert_rule nat "$NAT_CHAIN" -p udp --dport 53 -m mac --mac-source "$mac" \
+        -j REDIRECT --to-ports "$FORWARDER_PORT"
+
+    insert_rule filter "$FWD_CHAIN" -m mac --mac-source "$mac" -j ACCEPT
+
+    # Track this MAC for DNS refresh on ISP change
+    save_auth_mac "$mac"
+
+    # Existing connections were DNAT'ed to the portal; clear them so the
+    # client gets real internet right away.
+    flush_client_conntrack "$mac"
+
+    log "client authorized: $mac (dns -> local forwarder :$FORWARDER_PORT)"
+}
+
+cmd_unauth() {
+    local mac="$1"
+    valid_mac "$mac" || die "invalid MAC address: $mac"
+
+    remove_auth_rules "$mac"
+
+    # Remove from tracked MACs
+    remove_auth_mac "$mac"
+
+    # Clear the client's established connections so it is captured by the
+    # portal again immediately.
+    flush_client_conntrack "$mac"
+
+    log "client deauthorized: $mac"
+}
+
+# ============================================
+# AUTHORIZED MACs TRACKING
+# ============================================
+# Save authorized MAC to state file for DNS refresh on ISP change
+save_auth_mac() {
+    local mac="$1"
+    mkdir -p "$STATE_DIR"
+    # Add MAC if not already present
+    if [ -f "$AUTH_MACS_FILE" ]; then
+        grep -qi "^${mac}$" "$AUTH_MACS_FILE" 2>/dev/null || echo "$mac" >> "$AUTH_MACS_FILE"
+    else
+        echo "$mac" > "$AUTH_MACS_FILE"
+    fi
+}
+
+# Remove authorized MAC from state file
+remove_auth_mac() {
+    local mac="$1"
+    if [ -f "$AUTH_MACS_FILE" ]; then
+        # Remove the MAC (case-insensitive)
+        sed -i "/^${mac}$/Id" "$AUTH_MACS_FILE" 2>/dev/null
+        # Remove empty file
+        [ ! -s "$AUTH_MACS_FILE" ] && rm -f "$AUTH_MACS_FILE"
+    fi
+}
+
+# Get all authorized MACs
+get_auth_macs() {
+    if [ -f "$AUTH_MACS_FILE" ]; then
+        cat "$AUTH_MACS_FILE" 2>/dev/null
+    fi
+}
+
+# ============================================
+# REFRESH - Update DNS rules when ISP changes
+# ============================================
+cmd_refresh() {
+    # IMPORTANT: UPSTREAM_DNS was re-detected at script load (line above),
+    # so it ALWAYS equals the current DNS. The stale DNS lives in the
+    # existing per-MAC iptables DNAT rules, not in any variable we can
+    # compare against — an "unchanged" early-return here would ALWAYS fire
+    # and the refresh would never do anything. So we unconditionally
+    # rebuild the DNS DNAT rules for every tracked MAC with the freshly
+    # detected DNS. Rewriting an already-correct rule is harmless.
+    log "refresh: rebuilding DNS rules (redirect to local forwarder port $FORWARDER_PORT)"
+    echo "Refreshing authorized clients (DNS via local forwarder)"
+
+    # Re-authorize all tracked MACs with the current DNS
+    local macs
+    macs=$(get_auth_macs)
+    local count=0
+    
+    if [ -n "$macs" ]; then
+        while IFS= read -r mac; do
+            [ -z "$mac" ] && continue
+            # Remove old rules and re-authorize with new DNS
+            remove_auth_rules "$mac"
+            
+            # Re-add rules with new DNS
+            # Probe-release REDIRECT rules
+            local p
+            for p in "${PROBE_PATHS[@]}"; do
+                insert_rule nat "$NAT_CHAIN" -p tcp --dport 80 -m mac --mac-source "$mac" \
+                    -m addrtype --dst-type LOCAL -m string --algo bm \
+                    --string "$p" -j REDIRECT --to-ports "$API_PORT"
+            done
+            
+            # DNS DNAT/REDIRECT rules — old installs have DNAT rules pointing
+            # at a (possibly stale) ISP DNS; rebuild as REDIRECT to the local
+            # clean forwarder so the rule is ISP-independent going forward.
+            insert_rule nat "$NAT_CHAIN" -p tcp --dport 53 -m mac --mac-source "$mac" \
+                -j REDIRECT --to-ports "$FORWARDER_PORT"
+            insert_rule nat "$NAT_CHAIN" -p udp --dport 53 -m mac --mac-source "$mac" \
+                -j REDIRECT --to-ports "$FORWARDER_PORT"
+            
+            # Forward ACCEPT rule
+            insert_rule filter "$FWD_CHAIN" -m mac --mac-source "$mac" -j ACCEPT
+            
+            # Flush conntrack so client gets new DNS immediately
+            flush_client_conntrack "$mac"
+            
+            count=$((count + 1))
+            log "refreshed: $mac (dns -> local forwarder :$FORWARDER_PORT)"
+        done <<< "$macs"
+    fi
+    
+    echo "Refreshed $count client(s) (DNS via local forwarder :$FORWARDER_PORT)"
+    log "DNS refresh complete ($count clients, forwarder :$FORWARDER_PORT)"
+}
+
+# ============================================
+# STATUS
+# ============================================
+cmd_status() {
+    echo "--- nat $NAT_CHAIN ---"
+    iptables -t nat -S "$NAT_CHAIN" 2>/dev/null || echo "  (chain not present)"
+    echo ""
+    echo "--- filter $FWD_CHAIN ---"
+    iptables -S "$FWD_CHAIN" 2>/dev/null || echo "  (chain not present)"
+    echo ""
+    echo "--- mangle AIRCOINS_TTL (anti-hotspot, managed by Go API) ---"
+    iptables -t mangle -S AIRCOINS_TTL 2>/dev/null || echo "  (chain not present)"
+    echo ""
+    echo "--- nat POSTROUTING (MASQUERADE) ---"
+    iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE || echo "  (none)"
+    echo ""
+    echo "uplink:       $(detect_wan)"
+    echo "upstream dns: $UPSTREAM_DNS"
+    echo "ip_forward:   $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+    
+    # Show tracked authorized MACs
+    local mac_count=0
+    if [ -f "$AUTH_MACS_FILE" ] && [ -s "$AUTH_MACS_FILE" ]; then
+        mac_count=$(wc -l < "$AUTH_MACS_FILE" 2>/dev/null | tr -d ' ')
+    fi
+    echo "tracked MACs: $mac_count (for DNS refresh on ISP change)"
+}
+
+usage() {
+    cat <<'EOF'
+AirCoins Captive Portal Rules
+
+Usage:
+  aircoins-captive-rules add     <iface> <gateway>   Capture unauthenticated clients on a VLAN
+  aircoins-captive-rules del     <iface> <gateway>   Remove the capture rules for a VLAN
+  aircoins-captive-rules auth    <mac>               Whitelist a paying client (internet + real DNS)
+  aircoins-captive-rules unauth  <mac>               Revoke a client's access
+  aircoins-captive-rules refresh                     Update DNS rules for all authorized clients (after ISP change)
+  aircoins-captive-rules status                      Show current rules
+
+Note: Anti-hotspot (TTL=1) is managed by the Go API binary directly.
+
+Examples:
+  aircoins-captive-rules add end0.22 10.0.22.1
+  aircoins-captive-rules auth aa:bb:cc:dd:ee:ff
+  aircoins-captive-rules refresh   # Run after changing ISP to update DNS
+EOF
+}
+
+# ============================================
+# MAIN
+# ============================================
+if [ "$(id -u)" -ne 0 ]; then
+    die "must be run as root"
+fi
+
+if ! command -v iptables >/dev/null 2>&1; then
+    die "iptables not found"
+fi
+
+case "${1:-}" in
+    add)
+        [ $# -ge 3 ] && [ $# -le 4 ] || { usage; exit 1; }
+        cmd_add "$2" "$3"
+        ;;
+    del)
+        [ $# -ge 3 ] && [ $# -le 4 ] || { usage; exit 1; }
+        cmd_del "$2" "$3"
+        ;;
+    auth)
+        [ $# -eq 2 ] || { usage; exit 1; }
+        ensure_dns_forwarder
+        cmd_auth "$2"
+        ;;
+    unauth)
+        [ $# -eq 2 ] || { usage; exit 1; }
+        cmd_unauth "$2"
+        ;;
+    refresh)
+        ensure_dns_forwarder
+        cmd_refresh
+        ;;
+    status)
+        cmd_status
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

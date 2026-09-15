@@ -1,0 +1,138 @@
+#!/bin/bash
+# ============================================
+# AirCoins - GPIO Pin Test CGI Handler
+# ============================================
+# Reads the real state of a GPIO pin using board-aware methods
+# Called from admin panel "Test Pin" button
+#
+# PIN NUMBERING: the "pin" field is the PHYSICAL HEADER PIN number
+# (1..40 as printed on the board). The shared library translates it to
+# the kernel/sunxi line, e.g. Orange Pi PC physical pin 3 = PA12 =
+# sunxi GPIO 12 = gpiochip0 line 12.
+#
+# Also reports whether the line is BUSY (claimed by another driver such
+# as an i2c overlay on pins 3/5) so the operator knows to pick another
+# pin or disable the conflicting overlay.
+#
+# Install to: /usr/lib/cgi-bin/test_gpio
+# Requires: lighttpd mod_cgi enabled
+# ============================================
+
+# Source the shared GPIO library
+source /usr/local/bin/aircoins-gpio-lib
+
+CONFIG_FILE="/var/lib/pisowifi/gpio_config"
+
+# Load config to get current pin
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Re-detect board (config may override BOARD_MODEL)
+detect_board
+get_gpio_method
+
+# Read POST body for pin override
+read -r POST_DATA
+
+# If POST data contains a pin, use it; otherwise use configured pin
+if [ -n "$POST_DATA" ]; then
+    PIN=$(echo "$POST_DATA" | grep -o '"pin":[0-9]*' | cut -d: -f2)
+fi
+PIN=${PIN:-$COIN_PULSE_PIN}
+PIN=${PIN:-7}
+
+# JSON string escaping for messages coming out of the library
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ============================================
+# Run the shared pin test (key=value output)
+# ============================================
+R_PIN=""; R_GPIO=""; R_LABEL=""; R_METHOD=""; R_CHIP=""
+R_BOARD_FAMILY=""; R_BOARD_MODEL=""; R_BOARD_CHIPSET=""
+R_TRUSTED="1"; R_BUSY="unknown"; R_CONSUMER=""
+R_STATE=""; R_STATUS=""; R_MESSAGE=""; R_WARNING=""
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        pin)             R_PIN="$value" ;;
+        gpio)            R_GPIO="$value" ;;
+        label)           R_LABEL="$value" ;;
+        method)          R_METHOD="$value" ;;
+        chip)            R_CHIP="$value" ;;
+        board_family)    R_BOARD_FAMILY="$value" ;;
+        board_model)     R_BOARD_MODEL="$value" ;;
+        board_chipset)   R_BOARD_CHIPSET="$value" ;;
+        pin_map_trusted) R_TRUSTED="$value" ;;
+        busy)            R_BUSY="$value" ;;
+        busy_consumer)   R_CONSUMER="$value" ;;
+        state)           R_STATE="$value" ;;
+        status)          R_STATUS="$value" ;;
+        message)         R_MESSAGE="$value" ;;
+        warning)         R_WARNING="$value" ;;
+    esac
+done < <(gpio_test_pin "$PIN")
+
+R_PIN=${R_PIN:-$PIN}
+R_METHOD=${R_METHOD:-$GPIO_METHOD}
+R_BOARD_FAMILY=${R_BOARD_FAMILY:-$BOARD_FAMILY}
+R_BOARD_MODEL=${R_BOARD_MODEL:-$BOARD_MODEL}
+R_BOARD_CHIPSET=${R_BOARD_CHIPSET:-$BOARD_CHIPSET}
+R_STATUS=${R_STATUS:-error}
+
+# ============================================
+# Build the JSON response
+# ============================================
+echo "Content-Type: application/json"
+echo ""
+
+if [ "$R_STATUS" != "ok" ]; then
+    printf '{"status":"error","pin":%s,"gpio":"%s","label":"%s","method":"%s","chip":"%s","busy":"%s","busy_consumer":"%s","board_family":"%s","board_model":"%s","pin_map_trusted":%s,"message":"%s"}\n' \
+        "${R_PIN:-0}" \
+        "$(json_escape "$R_GPIO")" \
+        "$(json_escape "$R_LABEL")" \
+        "$(json_escape "$R_METHOD")" \
+        "$(json_escape "$R_CHIP")" \
+        "$(json_escape "$R_BUSY")" \
+        "$(json_escape "$R_CONSUMER")" \
+        "$(json_escape "$R_BOARD_FAMILY")" \
+        "$(json_escape "$R_BOARD_MODEL")" \
+        "${R_TRUSTED:-1}" \
+        "$(json_escape "${R_MESSAGE:-GPIO test failed}")"
+    exit 0
+fi
+
+if [ "$R_STATE" = "0" ]; then
+    STATE_TEXT="LOW (0)"
+    STATE_COLOR="#ff4444"
+else
+    STATE_TEXT="HIGH (1)"
+    STATE_COLOR="#00ff88"
+fi
+
+# WiringOP is the only backend that can enable the internal pull-up
+if [ "$R_METHOD" = "wiringop" ] || [ "$R_METHOD" = "raspi-gpio" ]; then
+    PULL_UP="enabled"
+else
+    PULL_UP="unavailable (external pull-up required)"
+fi
+
+printf '{"status":"ok","method":"%s","pin":%s,"gpio":%s,"label":"%s","chip":"%s","state":%s,"state_text":"%s","state_color":"%s","busy":"%s","busy_consumer":"%s","pull_up":"%s","board_family":"%s","board_model":"%s","board_chipset":"%s","pin_map_trusted":%s,"warning":"%s"}\n' \
+    "$(json_escape "$R_METHOD")" \
+    "${R_PIN:-0}" \
+    "${R_GPIO:-0}" \
+    "$(json_escape "$R_LABEL")" \
+    "$(json_escape "$R_CHIP")" \
+    "${R_STATE:-1}" \
+    "$STATE_TEXT" \
+    "$STATE_COLOR" \
+    "$(json_escape "$R_BUSY")" \
+    "$(json_escape "$R_CONSUMER")" \
+    "$PULL_UP" \
+    "$(json_escape "$R_BOARD_FAMILY")" \
+    "$(json_escape "$R_BOARD_MODEL")" \
+    "$(json_escape "$R_BOARD_CHIPSET")" \
+    "${R_TRUSTED:-1}" \
+    "$(json_escape "$R_WARNING")"

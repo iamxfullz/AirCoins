@@ -1,0 +1,705 @@
+#!/bin/bash
+# ============================================
+# AirCoins - GPIO Coin Listener Daemon
+# ============================================
+# Listens for coin pulses on GPIO pin
+# Supports Orange Pi (WiringOP), Raspberry Pi (raspi-gpio),
+# libgpiod, and sysfs fallbacks.
+#
+# Install to: /usr/local/bin/gpio-coin-listener
+# Runs as: systemd service
+#
+# GPIO PIN CONFIGURATION:
+#   Configurable via Admin Panel or /var/lib/pisowifi/gpio_config
+#   COIN_PULSE_PIN is the PHYSICAL HEADER PIN number (as printed on the
+#   40-pin header), NOT a sunxi/BCM GPIO number. On Orange Pi PC (H3)
+#   physical pin 3 = PA12 = gpiochip0 line 12; aircoins-gpio-lib does the
+#   translation. Default: physical pin 7 (PA6).
+#   Connect coin acceptor pulse wire to the selected pin
+#   Connect coin acceptor GND to board GND
+#
+# HOW IT WORKS (on-demand arm/disarm):
+#   1. Listener idles (1s file stat, no GPIO reads, ~0% CPU)
+#   2. Customer taps "Insert Coin" on the portal -> API writes
+#      /run/pisowifi/coinslot.armed (epoch when arming expires)
+#   3. Listener switches to ARMED and polls GPIO for coin pulses
+#   4. Coin pulse detected -> event posted to API, armed window
+#      extended by +30s (multi-coin insertion isn't cut off)
+#   5. Armed file gone/expired -> back to IDLE
+# ============================================
+
+# ============================================
+# SINGLE INSTANCE GUARD
+# ============================================
+# Two listeners on the same pin count every pulse twice (the journal shows
+# interleaved "Pulse #N" counters). Orphans survive a botched service stop,
+# so refuse to start when another instance already holds the lock.
+#
+# This runs BEFORE the cleanup trap is installed on purpose: a duplicate
+# must exit without touching the running instance's PID/armed files.
+# Exit 0 so systemd's Restart=on-failure does not loop on it.
+LOCK_FILE="/run/gpio-coin-listener.lock"
+exec 9>"$LOCK_FILE"
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    echo "gpio-coin-listener: another instance is already running, exiting" >&2
+    exit 0
+fi
+
+# Source the shared GPIO library
+GPIO_LIB="/usr/local/bin/aircoins-gpio-lib"
+if [ -f "$GPIO_LIB" ]; then
+    source "$GPIO_LIB"
+else
+    echo "ERROR: GPIO library not found at $GPIO_LIB" >&2
+    exit 1
+fi
+
+# ============================================
+# CONFIGURATION
+# ============================================
+# Default values (overridden by config file)
+COIN_PULSE_PIN=7                    # PHYSICAL header pin number
+COIN_VALUE=1                        # Peso value per pulse (1 pulse = P1; a P10 coin must send 10 pulses)
+PULSE_MODE="falling"                # falling, rising, or both
+DEBOUNCE_MS=30                      # ignore edges closer than this to the previous pulse;
+                                    # 30 ms default fits fast acceptors (50 ms pulse trains);
+                                    # settable from Admin > Settings > GPIO (gpio_config)
+RELAY_ENABLED=false                 # relay / light pin active while coin slot is armed
+RELAY_PIN=5                         # PHYSICAL header pin number driving the relay/light
+RELAY_INTENSITY=5                   # blink tempo 1 (slow) .. 10 (fast dance)
+
+# Config file (written by admin panel / API)
+CONFIG_FILE="/var/lib/pisowifi/gpio_config"
+
+# Load config from file if exists
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Convert RELAY_ENABLED (true/false/1/0) to canonical "true"/"false".
+case "${RELAY_ENABLED:-false}" in
+    1|true|TRUE|True|yes|YES|on|ON) RELAY_ENABLED=true ;;
+    *)                            RELAY_ENABLED=false ;;
+esac
+
+# RELAY_PIN defaults to physical pin 5 when unset; RELAY_INTENSITY (1-10)
+# defaults to 5 so the dance tempo always lands in range.
+RELAY_PIN="${RELAY_PIN:-5}"
+case "$RELAY_PIN" in
+    ''|*[!0-9]*) RELAY_PIN=5 ;;
+esac
+case "$RELAY_INTENSITY" in
+    ''|*[!0-9]*) RELAY_INTENSITY=5 ;;
+esac
+if [ "$RELAY_INTENSITY" -lt 1 ] 2>/dev/null; then RELAY_INTENSITY=1; fi
+if [ "$RELAY_INTENSITY" -gt 10 ] 2>/dev/null; then RELAY_INTENSITY=10; fi
+
+# Re-detect board after loading config (config may override BOARD_MODEL)
+detect_board
+get_gpio_method
+
+EVENT_FILE="/var/lib/pisowifi/coin_event"
+LOG_FILE="/var/log/pisowifi/gpio-coin.log"
+PID_FILE="/var/run/gpio-coin-listener.pid"
+STATE_FILE="/var/lib/pisowifi/gpio_state"
+ARMED_FILE="/run/pisowifi/coinslot.armed"   # written by API (POST /api/coinslot/arm)
+ARM_EXTEND_SEC=30                            # extra window per detected coin
+RELAY_BLINK_STOP="/run/pisowifi/relay.blink.stop"
+RELAY_BLINK_PID=""
+RELAY_USABLE=true
+
+# now_ms: milliseconds since epoch (for time-based debounce)
+now_ms() {
+    local ns
+    ns=$(date +%s%N 2>/dev/null)
+    case "$ns" in
+        ''|*[!0-9]*) echo $(( $(date +%s) * 1000 )) ;;   # date without %N
+        *)           echo $(( ns / 1000000 )) ;;
+    esac
+}
+LAST_PULSE_MS=0
+
+# ============================================
+# LOGGING
+# ============================================
+# Log to BOTH stdout (captured by the systemd journal) and the log file,
+# so `journalctl -u gpio-coin-listener` shows pulse detection live.
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+log() {
+    local line="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$line"
+    echo "$line" >> "$LOG_FILE"
+}
+
+# ============================================
+# MASTER GPIO TOGGLE
+# ============================================
+# Admin > Settings > GPIO "Enable GPIO" master switch (GPIO_ENABLED in
+# gpio_config). Off turns the whole GPIO feature (coin listener + relay
+# light) off — e.g. x86 Debian has no SBC GPIO header and does not need
+# it. Default is true (on) when the key is absent, so SBC boards keep
+# working across upgrades; install.sh writes false explicitly on x86.
+case "${GPIO_ENABLED:-true}" in
+    1|true|TRUE|True|yes|YES|on|ON) GPIO_ENABLED=true ;;
+    *)                              GPIO_ENABLED=false ;;
+esac
+# When the master toggle is OFF the listener exits immediately.  We exit
+# 1 (not 0) so systemd's Restart=on-failure keeps trying; combined with
+# the 30 s quiesce guard below this is harmless (the service sits stopped
+# for 30 s between attempts while the toggle is off, instead of spinning
+# at full speed).  The real fix for "toggle then reboot to get coins" is
+# in main.go: the API now restarts this service on boot when GPIO is
+# enabled in gpio_config, so a reboot no longer leaves the listener dead.
+if [ "$GPIO_ENABLED" = "false" ]; then
+    log "gpio-coin-listener: GPIO disabled by master toggle (Enable GPIO = off), exiting (systemd will retry)"
+    # Quiesce: do not hammer systemd with restart attempts while the
+    # toggle is off.  30 s is long enough to not be a busy-loop, short
+    # enough that flipping the toggle back on is felt within seconds.
+    sleep 30
+    exit 1
+fi
+log "gpio-coin-listener: master toggle on (board=$BOARD_MODEL, method=$GPIO_METHOD)"
+
+# ============================================
+# CLEANUP ON EXIT
+# ============================================
+cleanup() {
+    log "GPIO Coin Listener stopping..."
+    relay_blink_stop
+    relay_off
+    # Unexport GPIO if using sysfs
+    if [ "$GPIO_METHOD" = "sysfs" ] && [ -n "$INTERNAL_GPIO" ]; then
+        echo "$INTERNAL_GPIO" > /sys/class/gpio/unexport 2>/dev/null
+    fi
+    rm -f "$PID_FILE" "$ARMED_FILE"
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT EXIT
+
+# ============================================
+# WRITE PID
+# ============================================
+echo $$ > "$PID_FILE"
+
+# Remove stale armed file from a previous run (/run is tmpfs, but be safe)
+rm -f "$ARMED_FILE"
+
+log "GPIO Coin Listener started (PID: $$)"
+log "Board: $BOARD_FAMILY / $BOARD_MODEL ($BOARD_CHIPSET)"
+log "GPIO method: $GPIO_METHOD"
+log "Listening on PHYSICAL header pin: $COIN_PULSE_PIN"
+log "Coin value per pulse: P$COIN_VALUE (acceptor must send 1 pulse per peso: P5 = 5 pulses, P10 = 10 pulses)"
+log "Pulse debounce: ${DEBOUNCE_MS} ms"
+if [ "$RELAY_ENABLED" = "true" ]; then
+    log "Relay/light: ENABLED on physical pin $RELAY_PIN (blink tempo $RELAY_INTENSITY/10 while armed)"
+    check_relay_availability
+else
+    log "Relay/light: disabled (Admin > Settings > GPIO to enable)"
+fi
+
+# ============================================
+# Resolve the physical header pin to a kernel GPIO line
+# ============================================
+# The pin in the config is a PHYSICAL header pin. All GPIO access goes
+# through aircoins-gpio-lib, which translates it per backend (physical for
+# WiringOP, sunxi/BCM number for gpiod/sysfs). Physical pin 3 is PA12/line
+# 12 on an Orange Pi PC — it is NOT GPIO 3.
+INTERNAL_GPIO=$(pin_to_gpio "$COIN_PULSE_PIN")
+if [ $? -ne 0 ] || [ -z "$INTERNAL_GPIO" ]; then
+    log "ERROR: physical pin $COIN_PULSE_PIN is not a usable GPIO on $BOARD_FAMILY/$BOARD_CHIPSET"
+    log "       Available physical pins: $(get_available_pins)"
+    exit 1
+fi
+PIN_LABEL=$(pin_to_label "$COIN_PULSE_PIN")
+GPIO_CHIP_NAME=$(gpio_chip_name)
+log "Physical pin $COIN_PULSE_PIN = $PIN_LABEL = $GPIO_CHIP_NAME line $INTERNAL_GPIO"
+
+if [ "$PIN_MAP_TRUSTED" != "1" ]; then
+    log "WARNING: header pin map for '$BOARD_MODEL' is unverified; using the Orange Pi H3 40-pin map"
+fi
+
+# Warn about pins whose alternate function is usually claimed by a driver
+PIN_NOTE=$(pin_conflict_note "$COIN_PULSE_PIN")
+if [ -n "$PIN_NOTE" ]; then
+    log "NOTE: $PIN_NOTE"
+fi
+
+# stream_falling_edges <seconds>: one long-lived gpiomon printing one
+# line per falling edge.  Deliberately INLINED here (instead of calling
+# the lib's gpio_stream_falling_edges) because OTA updates shipped by
+# old API binaries never refreshed aircoins-gpio-lib on disk — relying
+# on the lib would silently drop this whole code path into the lossy
+# polling fallback on already-deployed devices.
+stream_falling_edges() {
+    local seconds=$1
+    if [ "$(gpiod_major)" = "2" ]; then
+        timeout "$seconds" gpiomon --edges falling \
+            -c "$GPIO_CHIP_NAME" "$INTERNAL_GPIO" 2>/dev/null
+    else
+        timeout "$seconds" gpiomon --falling-edge \
+            "$GPIO_CHIP_NAME" "$INTERNAL_GPIO" 2>/dev/null
+    fi
+}
+
+# ============================================
+# Is the line already claimed by another driver?
+# ============================================
+# i2c/spi/uart nodes claim their pads at boot. A claimed line cannot be
+# read as GPIO (gpiod: "Device or resource busy") and coins are silently
+# never detected — so say it loudly, once, at startup.
+check_pin_availability() {
+    gpio_line_busy "$COIN_PULSE_PIN"
+    case $? in
+        0)
+            log "ERROR: =============================================="
+            log "ERROR: physical pin $COIN_PULSE_PIN ($PIN_LABEL, $GPIO_CHIP_NAME line $INTERNAL_GPIO) IS BUSY"
+            log "ERROR: $GPIO_BUSY_REASON"
+            [ -n "$PIN_NOTE" ] && log "ERROR: $PIN_NOTE"
+            log "ERROR: NO COINS WILL BE DETECTED on this pin."
+            log "ERROR: Fix: disable the driver/overlay that owns it, or pick"
+            log "ERROR:      another pin in Admin > Settings > GPIO."
+            log "ERROR: =============================================="
+            return 1
+            ;;
+        1)
+            log "Pin availability check: line $INTERNAL_GPIO is free"
+            ;;
+        *)
+            log "Pin availability check: could not determine whether line $INTERNAL_GPIO is free"
+            ;;
+    esac
+    return 0
+}
+
+# ============================================
+# ARM/DISARM HELPERS
+# ============================================
+# coinslot_armed: returns 0 while the armed window is open.
+# Removes the armed file when it is expired or corrupt.
+coinslot_armed() {
+    [ -f "$ARMED_FILE" ] || return 1
+
+    local expires
+    expires=$(cat "$ARMED_FILE" 2>/dev/null | tr -d '[:space:]')
+
+    # Must be a plain number (epoch seconds)
+    case "$expires" in
+        ''|*[!0-9]*)
+            rm -f "$ARMED_FILE"
+            return 1
+            ;;
+    esac
+
+    if [ "$(date +%s)" -ge "$expires" ]; then
+        rm -f "$ARMED_FILE"
+        return 1
+    fi
+
+    return 0
+}
+
+# extend_armed_window: push expiry +ARM_EXTEND_SEC so multi-coin
+# insertion isn't cut off mid-payment
+extend_armed_window() {
+    echo $(( $(date +%s) + ARM_EXTEND_SEC )) > "$ARMED_FILE"
+}
+
+# handle_coin_pulse: log, post event to API, extend window.
+#
+# IMPORTANT: keep this fast.  Multi-peso coins fire a rapid train of
+# pulses (typically 50-100 ms apart).  Any per-pulse sleep or blocking
+# wait makes the listener blind while the next pulse arrives — that is
+# exactly how a 10-peso coin used to read as a 4-peso coin.  Time-based
+# debouncing is done by the callers (edge-detect loops) instead.
+handle_coin_pulse() {
+    COIN_COUNT=$((COIN_COUNT + 1))
+
+    log "COIN DETECTED! Pulse #$COIN_COUNT | Value: P$COIN_VALUE"
+
+    # Send coin event to Go API (backgrounded so it cannot delay the
+    # next pulse)
+    curl -s -X POST http://localhost:8080/api/gpio/coin \
+        -H "Content-Type: application/json" \
+        -d "{\"coin_value\": $COIN_VALUE}" > /dev/null 2>&1 &
+
+    # Update state
+    echo "$COIN_COUNT" > "$STATE_FILE"
+
+    # Keep the slot armed for follow-up coins
+    extend_armed_window
+
+    # Quick bright flash on the relay/light for feedback
+    relay_coin_flash
+}
+
+check_relay_availability() {
+    local relay_gpio relay_label relay_note busy_msg="" busy_flag=2
+    relay_gpio=$(pin_to_gpio "$RELAY_PIN" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$relay_gpio" ]; then
+        log "ERROR: relay pin $RELAY_PIN is not a usable GPIO on $BOARD_FAMILY/$BOARD_CHIPSET"
+        log "ERROR: Available physical pins: $(get_available_pins)"
+        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
+        RELAY_USABLE=false
+        return 1
+    fi
+    relay_label=$(pin_to_label "$RELAY_PIN")
+    log "Relay pin: physical pin $RELAY_PIN = $relay_label = $GPIO_CHIP_NAME line $relay_gpio"
+    relay_note=$(pin_conflict_note "$RELAY_PIN")
+    if [ -n "$relay_note" ]; then
+        log "NOTE: $relay_note"
+    fi
+    if [ "$GPIO_METHOD" != "none" ]; then
+        gpio_line_busy "$RELAY_PIN"
+        busy_flag=$?
+        busy_msg="$GPIO_BUSY_REASON"
+    fi
+    if [ "$busy_flag" = "0" ]; then
+        log "ERROR: relay pin $RELAY_PIN ($GPIO_CHIP_NAME line $relay_gpio) IS BUSY"
+        log "ERROR: $busy_msg"
+        log "ERROR: Relay/light disabled for this run (coin detection unaffected)"
+        RELAY_USABLE=false
+        return 1
+    fi
+    RELAY_USABLE=true
+    return 0
+}
+
+relay_off() {
+    [ "$RELAY_ENABLED" = "true" ] || return 0
+    [ "${RELAY_USABLE:-true}" = "true" ] || return 0
+    [ "$RELAY_PIN" = "$COIN_PULSE_PIN" ] && return 0
+    gpio_write "$RELAY_PIN" 0 2>/dev/null
+    return 0
+}
+
+# relay_blink_tempo <intensity 1-10>: prints "<on_ms> <off_ms>" - higher
+# intensity = faster, more energetic dance; lower = slow calm blink.
+relay_blink_tempo() {
+    local i=$1
+    case "$i" in
+        ''|*[!0-9]*) i=5 ;;
+    esac
+    if [ "$i" -lt 1 ]; then i=1; fi
+    if [ "$i" -gt 10 ]; then i=10; fi
+    case "$i" in
+        1)  echo "600 600" ;;
+        2)  echo "450 450" ;;
+        3)  echo "330 330" ;;
+        4)  echo "240 240" ;;
+        5)  echo "170 170" ;;
+        6)  echo "120 120" ;;
+        7)  echo "90 90" ;;
+        8)  echo "65 65" ;;
+        9)  echo "45 45" ;;
+        10) echo "30 30" ;;
+        *)  echo "170 170" ;;
+    esac
+}
+
+# relay_blink_loop: background blink while armed. Runs until RELAY_BLINK_STOP
+# is touched. ONE writer only (this loop) so timing is smooth.
+relay_blink_loop() {
+    local on_ms off_ms on_s off_s
+    set -- $(relay_blink_tempo "$RELAY_INTENSITY")
+    on_ms=$1
+    off_ms=$2
+    on_s=$(awk "BEGIN{printf \"%.3f\", $on_ms/1000}")
+    off_s=$(awk "BEGIN{printf \"%.3f\", $off_ms/1000}")
+    [ -z "$on_s" ] && on_s=0.17
+    [ -z "$off_s" ] && off_s=0.17
+    while [ ! -f "$RELAY_BLINK_STOP" ]; do
+        gpio_write "$RELAY_PIN" 1 2>/dev/null
+        sleep "$on_s"
+        [ -f "$RELAY_BLINK_STOP" ] && break
+        gpio_write "$RELAY_PIN" 0 2>/dev/null
+        sleep "$off_s"
+    done
+}
+
+relay_blink_start() {
+    [ "$RELAY_ENABLED" = "true" ] || return 0
+    [ "${RELAY_USABLE:-true}" = "true" ] || return 0
+    [ "$RELAY_PIN" = "$COIN_PULSE_PIN" ] && return 0
+    relay_blink_stop
+    rm -f "$RELAY_BLINK_STOP"
+    gpio_setup_output "$RELAY_PIN" 2>/dev/null
+    relay_blink_loop &
+    RELAY_BLINK_PID=$!
+}
+
+relay_blink_stop() {
+    [ -n "${RELAY_BLINK_PID:-}" ] && kill "$RELAY_BLINK_PID" 2>/dev/null
+    RELAY_BLINK_PID=""
+    touch "$RELAY_BLINK_STOP" 2>/dev/null
+    sleep 0.05 2>/dev/null || true
+}
+
+# relay_coin_flash: quick bright burst on each detected coin, then the blink
+# loop resumes on its own. Backgrounded so pulse handling stays instant.
+relay_coin_flash() {
+    [ "$RELAY_ENABLED" = "true" ] || return 0
+    [ "${RELAY_USABLE:-true}" = "true" ] || return 0
+    [ "$RELAY_PIN" = "$COIN_PULSE_PIN" ] && return 0
+    (
+        gpio_write "$RELAY_PIN" 1 2>/dev/null
+        sleep 0.12
+        # Only restore LOW if the blink loop is not mid-cycle; either way
+        # the loop rewrites the level on its next tick.
+        [ -f "$RELAY_BLINK_STOP" ] || gpio_write "$RELAY_PIN" 0 2>/dev/null
+    ) &
+}
+
+# accept_pulse_edge: time-based debounce gate shared by both armed loops.
+# Returns 0 (count this edge) only when it is at least DEBOUNCE_MS after
+# the previously accepted pulse; electrical bounce of the same physical
+# pulse is suppressed without any blocking sleep.
+accept_pulse_edge() {
+    local t
+    t=$(now_ms)
+    if [ $((t - LAST_PULSE_MS)) -ge "$DEBOUNCE_MS" ]; then
+        LAST_PULSE_MS=$t
+        return 0
+    fi
+    return 1
+}
+
+# ============================================
+# ARMED LOOPS
+# ============================================
+# Edge-triggered wait via libgpiod gpiomon.
+#
+# We run ONE long-lived gpiomon for the whole armed window and stream
+# its events, instead of restarting gpiomon after every pulse.  The old
+# per-pulse restart left a blind gap between pulses (sleep + wait-for-
+# HIGH polling + process start-up + line re-claim, ~250 ms) and every
+# edge arriving in that gap was lost forever.  A 10-peso coin fires 10
+# pulses ~50 ms apart, so only ~4 of them were counted.  With the
+# stream open the whole time, every falling edge is queued by the
+# kernel and read out one by one — no pulse can be missed no matter how
+# fast the train is.
+armed_loop_gpiomon() {
+    local expires now remaining started elapsed count evline
+    while coinslot_armed; do
+        expires=$(cat "$ARMED_FILE" 2>/dev/null | tr -d '[:space:]')
+        now=$(date +%s)
+        remaining=$((expires - now))
+        [ "$remaining" -ge 1 ] || break
+
+        started=$(date +%s)
+        count=0
+        while IFS= read -r evline; do
+            [ -n "$evline" ] || continue
+            if accept_pulse_edge; then
+                handle_coin_pulse
+                count=$((count + 1))
+            else
+                # Diagnostic: a real edge that the debounce gate ate.
+                # If multi-peso coins under-count, these lines plus the
+                # configured debounce tell you exactly what to lower.
+                log "edge ignored by debounce (<${DEBOUNCE_MS}ms after last pulse)"
+            fi
+        done < <(stream_falling_edges "$remaining")
+
+        elapsed=$(( $(date +%s) - started ))
+        if [ "$count" -eq 0 ] && [ "$elapsed" -lt 3 ] && [ "$remaining" -gt 3 ]; then
+            # gpiomon died immediately (line busy / unusable) — fall
+            # back to polling for the rest of this armed window
+            log "WARNING: edge-triggered wait unavailable on pin $COIN_PULSE_PIN, falling back to polling"
+            USE_GPIOMON=0
+            armed_loop_poll
+            return
+        fi
+    done
+}
+
+# Fallback: fast polling for coin pulses while armed (10ms interval)
+#
+# Edge tracking: we detect a coin when the pin transitions HIGH→LOW.
+# After handling the pulse we wait for the pin to return HIGH before
+# looking for the next falling edge.  This prevents the same LOW level
+# from being counted as multiple coins, while still catching rapid
+# multi-pulse trains (each new pulse is a new HIGH→LOW transition).
+# Bounce re-triggers inside DEBOUNCE_MS are resynced but not counted.
+#
+# FIRST-PULSE FIX: prev_state is seeded from a REAL read of the pin on
+# every arm (not assumed HIGH).  After a long idle the line may already
+# be LOW (acceptor idle state / float / stuck), and assuming HIGH would
+# either invent a phantom coin or swallow the first real edge.  Reading
+# once also absorbs any stale level left over from the previous window.
+armed_loop_poll() {
+    local prev_state current_state wait_hi
+    prev_state=$(gpio_read "$COIN_PULSE_PIN")
+    case "$prev_state" in
+        0|1) ;;
+        *)   prev_state=1 ;;
+    esac
+    while coinslot_armed; do
+        # Read current pin state (physical pin; lib translates)
+        current_state=$(gpio_read "$COIN_PULSE_PIN")
+        case "$current_state" in
+            0|1) ;;
+            *)   current_state="$prev_state" ;;  # transient read error: hold last known, don't invent an edge
+        esac
+
+        # Detect falling edge (HIGH -> LOW = coin inserted)
+        if [ "$prev_state" = "1" ] && [ "$current_state" = "0" ]; then
+            if accept_pulse_edge; then
+                handle_coin_pulse
+            else
+                log "edge ignored by debounce (<${DEBOUNCE_MS}ms after last pulse)"
+            fi
+
+            # Wait for the pin to return HIGH before watching for the
+            # next falling edge.  A 1-second timeout guards against a
+            # stuck-low line freezing the loop forever.
+            wait_hi=0
+            while [ "$(gpio_read "$COIN_PULSE_PIN")" = "0" ] && [ $wait_hi -lt 100 ]; do
+                sleep 0.01
+                wait_hi=$((wait_hi + 1))
+            done
+            current_state=1  # pin is HIGH again (or timed out)
+        fi
+
+        prev_state=$current_state
+
+        # Small delay to prevent CPU hogging (10ms poll interval)
+        sleep 0.01
+    done
+}
+
+# ============================================
+# METHOD: Hardware GPIO (wiringop, raspi-gpio, libgpiod, sysfs)
+# ============================================
+if [ "$GPIO_METHOD" != "none" ]; then
+    log "Using $GPIO_METHOD for GPIO detection"
+
+    # Report immediately if the line is claimed by another driver
+    check_pin_availability
+    PIN_AVAILABLE=$?
+
+    # Set pin mode to input with pull-up (physical pin; lib translates).
+    # We check the result here: if the pin cannot be configured at startup
+    # the listener must not continue in a broken state (coins would never
+    # register).  Exit non-zero so systemd Restart=on-failure retries on a
+    # backoff schedule instead of leaving a live-but-blind daemon.
+    if ! gpio_setup_input "$COIN_PULSE_PIN" "up"; then
+        log "ERROR: gpio_setup_input failed for physical pin $COIN_PULSE_PIN - coin detection will not work; exiting for systemd retry"
+        exit 1
+    fi
+
+    if [ "$GPIO_METHOD" = "libgpiod" ] || [ "$GPIO_METHOD" = "sysfs" ]; then
+        log "NOTE: $GPIO_METHOD cannot enable the internal pull-up; the coin"
+        log "      acceptor needs an external pull-up to 3.3V (or install WiringOP)"
+    fi
+
+    # Initialize state file
+    echo "0" > "$STATE_FILE"
+
+    COIN_COUNT=0
+
+    # Prefer edge-triggered waiting when libgpiod's gpiomon is available
+    USE_GPIOMON=0
+    if [ "$GPIO_METHOD" = "libgpiod" ] && command -v gpiomon &>/dev/null && command -v timeout &>/dev/null; then
+        USE_GPIOMON=1
+        log "gpiomon available - using edge-triggered waiting while armed"
+    fi
+
+    log "Coin slot IDLE - waiting for arm request from portal"
+
+    # Outer state machine: IDLE <-> ARMED
+    while true; do
+        # IDLE: cheap file checks, no GPIO reads at all — but poll every
+        # 0.2 s (not 1 s) so the gap between "Insert Coin" tap and the
+        # start of edge detection is at most ~200 ms.  The old 1 s sleep
+        # could swallow the first pulse(s) of a fast coin drop.
+        if ! coinslot_armed; then
+            sleep 0.2
+            continue
+        fi
+
+        # ARMED: actively listen for coin pulses until window closes
+        log "Coin slot ARMED - listening for coin pulses on physical pin $COIN_PULSE_PIN ($PIN_LABEL, line $INTERNAL_GPIO)"
+        if [ "$RELAY_ENABLED" = "true" ] && [ "$RELAY_PIN" != "$COIN_PULSE_PIN" ]; then
+            relay_blink_start
+        fi
+
+        # RE-ARM HYGIENE: the acceptor line may have floated or stuck while
+        # we sat idle (especially after a long no-coin period).  Re-assert
+        # the input + pull-up and drain any stale level so the first real
+        # edge of this window is caught, not the leftover of the last one.
+        #
+        # Retry up to 3 times with a short backoff: a transient pin conflict
+        # (e.g. another driver briefly claiming the line) that clears within
+        # a couple hundred ms should not leave the listener blind.  After 3
+        # failures we give up on this armed window — the next arm attempt
+        # will retry, and if setup keeps failing the startup-level failure
+        # above (or the next re-arm) will exit non-zero for systemd retry.
+        local setup_ok=1
+        for _setup_try in 1 2 3; do
+            if gpio_setup_input "$COIN_PULSE_PIN" "up" 2>/dev/null; then
+                setup_ok=0
+                break
+            fi
+            sleep 0.1
+        done
+        if [ "$setup_ok" != "0" ]; then
+            log "WARNING: gpio_setup_input failed after 3 retries on re-arm (physical pin $COIN_PULSE_PIN) - coin detection may be impaired this window"
+        fi
+
+        # Re-check on every arm if the pin was busy at startup: the operator
+        # may have disabled the conflicting overlay without restarting us.
+        if [ "$PIN_AVAILABLE" != "0" ]; then
+            check_pin_availability
+            PIN_AVAILABLE=$?
+        fi
+
+        if [ "$USE_GPIOMON" = "1" ]; then
+            armed_loop_gpiomon
+        else
+            armed_loop_poll
+        fi
+        relay_blink_stop
+        relay_off
+        log "Armed window closed - coin slot back to IDLE"
+    done
+
+# ============================================
+# FALLBACK: File-based test mode (x86 / no GPIO)
+# ============================================
+# For development/testing on x86 or systems without GPIO
+# Simulate coins by writing to the event file:
+#   echo '5' > /var/lib/pisowifi/coin_event
+else
+    log "No GPIO hardware found - running in FILE-BASED TEST MODE"
+    log "To simulate a coin: echo '<coin_value>' > $EVENT_FILE"
+    log "  Example: echo '5' > $EVENT_FILE  (for P5 coin)"
+
+    COIN_COUNT=0
+
+    while true; do
+        # Check if event file has content
+        if [ -f "$EVENT_FILE" ]; then
+            event_content=$(cat "$EVENT_FILE" 2>/dev/null)
+            > "$EVENT_FILE"  # Clear the file
+
+            coin_value=$(echo "$event_content" | awk '{print $1}')
+
+            if [ -n "$coin_value" ] && [ "$coin_value" != "0" ] && [ "$coin_value" -gt 0 ] 2>/dev/null; then
+                COIN_COUNT=$((COIN_COUNT + 1))
+                log "COIN DETECTED (test mode)! Pulse #$COIN_COUNT | Value: P$coin_value"
+
+                # Send coin event to Go API
+                curl -s -X POST http://localhost:8080/api/gpio/coin \
+                    -H "Content-Type: application/json" \
+                    -d "{\"coin_value\": $coin_value}" > /dev/null 2>&1 &
+
+                # Update state
+                echo "$COIN_COUNT" > "$STATE_FILE"
+            fi
+        fi
+
+        # Poll interval (100ms for responsive test mode)
+        sleep 0.1
+    done
+fi

@@ -1,0 +1,54 @@
+# ============================================
+# Line-ending policy
+# ============================================
+# Shell scripts and daemons run on the SBC (Linux). They MUST keep LF
+# endings — CRLF breaks them ("\r: command not found"). Force LF on
+# checkout too (eol=lf), so Windows editors can never re-introduce CRLF.
+* text=auto
+
+# Shell scripts / services / embedded scripts
+*.sh          text eol=lf
+*.service     text eol=lf
+install.sh    text eol=lf
+zerotier-install text eol=lf
+aircoins-captive-rules text eol=lf
+aircoins-gpio-lib      text eol=lf
+gpio-coin-listener     text eol=lf
+*.sql         text eol=lf
+
+# Windows/DS-side files keep native CRLF
+*.ps1         text eol=crlf
+*.bat         text eol=crlf
+
+# Binaries — never touch
+*.bin         binary
+*.elf         binary
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.ico         binary
+*.gz          binary
+
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Shell scripts deployed to Linux MUST use LF line endings
+*.sh text eol=lf
+*gpio-coin-listener text eol=lf
+*test_gpio text eol=lf
+*set_gpio_config text eol=lf
+*pisowifi-* text eol=lf
+*aircoins-gpio-lib text eol=lf
+*aircoins-vlan-apply text eol=lf
+*aircoins-captive-rules text eol=lf
+*.service text eol=lf
+
+# SQL applied on the device with psql
+*.sql text eol=lf
+
+# Linux config files deployed verbatim
+*lighttpd.conf text eol=lf
+*captive.conf text eol=lf
+*99-aircoins.conf text eol=lf
+*.network text eol=lf

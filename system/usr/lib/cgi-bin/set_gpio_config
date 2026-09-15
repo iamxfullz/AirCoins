@@ -1,0 +1,118 @@
+#!/bin/bash
+# ============================================
+# AirCoins - GPIO Config CGI Handler
+# ============================================
+# Receives GPIO config from admin panel
+# Writes to /var/lib/pisowifi/gpio_config
+#
+# PIN NUMBERING: "pin" is the PHYSICAL HEADER PIN number (1..40 as
+# printed on the board), NOT a BCM/sunxi GPIO number. COIN_PULSE_PIN is
+# stored in that same physical numbering and translated by
+# aircoins-gpio-lib (Orange Pi PC: physical pin 3 = PA12 = GPIO 12).
+#
+# Install to: /usr/lib/cgi-bin/set_gpio_config
+# Requires: lighttpd mod_cgi enabled
+# ============================================
+
+# Shared library gives us the physical-pin map for this board
+if [ -f /usr/local/bin/aircoins-gpio-lib ]; then
+    source /usr/local/bin/aircoins-gpio-lib
+fi
+
+CONFIG_FILE="/var/lib/pisowifi/gpio_config"
+
+# Preserve the current values as defaults: the admin panel may POST a
+# partial update (e.g. the "Enable GPIO" master switch alone), and a
+# clobber of the configured physical pin must never happen.
+PIN=7
+COIN_VALUE=1
+PULSE_MODE="falling"
+BOARD_MODEL="auto"
+DEBOUNCE_MS=30
+GPIO_ENABLED=true
+RELAY_PIN=5
+RELAY_ENABLED=false
+RELAY_INTENSITY=5
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Read POST body
+read -r POST_DATA
+
+# Parse JSON (using basic shell parsing - no jq dependency required)
+# Expected format: {"pin":7,"coin_value":1,"pulse_mode":"falling","board_model":"auto","debounce_ms":30,"gpio_enabled":true}
+
+# Extract values using grep/sed - only fields present in the body override
+# the preserved defaults above
+_NEW=$(echo "$POST_DATA" | grep -o '"pin":[0-9]*' | cut -d: -f2)
+[ -n "$_NEW" ] && PIN=$_NEW
+_NEW=$(echo "$POST_DATA" | grep -o '"coin_value":[0-9]*' | cut -d: -f2)
+[ -n "$_NEW" ] && COIN_VALUE=$_NEW
+_NEW=$(echo "$POST_DATA" | grep -o '"pulse_mode":"[^"]*"' | cut -d'"' -f4)
+[ -n "$_NEW" ] && PULSE_MODE=$_NEW
+_NEW=$(echo "$POST_DATA" | grep -o '"board_model":"[^"]*"' | cut -d'"' -f4)
+[ -n "$_NEW" ] && BOARD_MODEL=$_NEW
+_NEW=$(echo "$POST_DATA" | grep -o '"debounce_ms":[0-9]*' | cut -d: -f2)
+[ -n "$_NEW" ] && DEBOUNCE_MS=$_NEW
+# Master GPIO toggle ("gpio_enabled":true / :false). 1/0 accepted too.
+_NEW=$(echo "$POST_DATA" | grep -o '"gpio_enabled":\(true\|false\|1\|0\)' | cut -d: -f2)
+if [ -n "$_NEW" ]; then
+    case "$_NEW" in
+        1|true) GPIO_ENABLED=true ;;
+        *)      GPIO_ENABLED=false ;;
+    esac
+fi
+
+# Clamp debounce to a sane range (ms)
+[ "$DEBOUNCE_MS" -lt 5 ] 2>/dev/null && DEBOUNCE_MS=5
+[ "$DEBOUNCE_MS" -gt 1000 ] 2>/dev/null && DEBOUNCE_MS=1000
+
+# Validate the physical pin against this board's header map and resolve
+# its label so the log/response show exactly which pad was selected
+PIN_LABEL=""
+INTERNAL_GPIO=""
+PIN_NOTE=""
+if type pin_to_gpio &>/dev/null 2>&1; then
+    INTERNAL_GPIO=$(pin_to_gpio "$PIN")
+    if [ $? -ne 0 ] || [ -z "$INTERNAL_GPIO" ]; then
+        echo "Content-Type: application/json"
+        echo ""
+        echo '{"status":"error","message":"Physical pin '"$PIN"' is not a usable GPIO on this board. Valid physical pins: '"$(get_available_pins)"'"}'
+        exit 0
+    fi
+    PIN_LABEL=$(pin_to_label "$PIN")
+    PIN_NOTE=$(pin_conflict_note "$PIN")
+fi
+
+# Canonicalize the master toggle for the sourceable config
+if [ "$GPIO_ENABLED" = "true" ]; then GPIO_ENABLED=true; else GPIO_ENABLED=false; fi
+
+# Write config file (bash sourceable format)
+cat > "$CONFIG_FILE" << EOF
+# AirCoins GPIO Config - Written by admin panel
+# $(date '+%Y-%m-%d %H:%M:%S')
+# COIN_PULSE_PIN is a PHYSICAL HEADER PIN number (not a GPIO number)
+# GPIO_ENABLED is the Admin > Settings > GPIO master toggle: off = no SBC
+# GPIO (coin listener + relay light stay off; x86 Debian needs no GPIO)
+GPIO_ENABLED=$GPIO_ENABLED
+COIN_PULSE_PIN=$PIN
+COIN_VALUE=$COIN_VALUE
+PULSE_MODE="$PULSE_MODE"
+BOARD_MODEL="$BOARD_MODEL"
+DEBOUNCE_MS=$DEBOUNCE_MS
+EOF
+
+# Set permissions
+chmod 644 "$CONFIG_FILE"
+
+# Log the change
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] GPIO config updated: master toggle=$GPIO_ENABLED, physical pin=$PIN${PIN_LABEL:+ ($PIN_LABEL, GPIO $INTERNAL_GPIO)}, Value=P$COIN_VALUE, Mode=$PULSE_MODE, Board=$BOARD_MODEL, Debounce=${DEBOUNCE_MS}ms" >> /var/log/pisowifi/gpio-coin.log
+if [ -n "$PIN_NOTE" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: physical pin $PIN - $PIN_NOTE" >> /var/log/pisowifi/gpio-coin.log
+fi
+
+# Return success response
+echo "Content-Type: application/json"
+echo ""
+echo '{"status":"ok","gpio_enabled":'$GPIO_ENABLED',"pin":'$PIN',"pin_numbering":"physical","label":"'$PIN_LABEL'","gpio":"'$INTERNAL_GPIO'","warning":"'$PIN_NOTE'","coin_value":'$COIN_VALUE',"pulse_mode":"'$PULSE_MODE'","board_model":"'$BOARD_MODEL'","message":"Config saved. Restart GPIO listener to apply."}'

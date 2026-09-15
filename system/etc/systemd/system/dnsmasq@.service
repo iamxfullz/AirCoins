@@ -1,0 +1,14 @@
+[Unit]
+Description=dnsmasq DHCP/DNS for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/etc/dnsmasq.d/%i.conf --pid-file=/run/dnsmasq-%i.pid
+ExecStopPost=/bin/rm -f /run/dnsmasq-%i.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

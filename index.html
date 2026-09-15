@@ -1,0 +1,2089 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>AirCoins - PisoNet System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; }
+        /* Portal appearance variables — the defaults below are EXACTLY the
+           built-in dark look. GET /api/portal/appearance (edited on the
+           admin "Portal" page) overrides them at runtime; when the API is
+           unreachable these defaults stand and nothing changes visually. */
+        :root {
+            --pp-primary: #1a1a2e;
+            --pp-accent: #ffd700;
+            --pp-bg: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            --pp-card: rgba(255,255,255,0.05);
+            --pp-text: #fff;
+            --pp-btn: linear-gradient(145deg, #ffd700, #ff8c00);
+            --pp-btn-text: #000;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--pp-bg);
+            /* Captive-portal webviews: lock the layout to the visible
+               viewport so the home screen never scrolls. */
+            height: 100vh;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            color: var(--pp-text);
+            overflow: hidden;
+        }
+
+        /* NAV */
+        .navbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 16px;
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+            flex-shrink: 0;
+        }
+        .navbar .logo { font-size: 15px; font-weight: bold; color: #00d4ff; }
+        .navbar .logo span { color: #ffd700; }
+        .nav-links { display: flex; gap: 8px; }
+        .nav-links a {
+            color: #ccc;
+            text-decoration: none;
+            padding: 6px 14px;
+            border-radius: 16px;
+            font-size: 14px;
+            transition: 0.3s;
+            cursor: pointer;
+        }
+        .nav-links a:hover, .nav-links a.active {
+            background: #00d4ff;
+            color: #000;
+        }
+
+        /* PAGES */
+        /* The home page is a flex column filling the space under the nav;
+           sections sit close together as one top-anchored block (leftover
+           space goes below the group, never between items). If a
+           tiny screen still overflows, the page scrolls internally while
+           the document itself stays at viewport height. */
+        .page {
+            display: none;
+            padding: 10px 16px;
+            width: 100%;
+            max-width: 520px;
+            margin: 0 auto;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        .page.active { display: flex; flex-direction: column; justify-content: flex-start; gap: 8px; padding: 10px 12px; }
+
+        /* HOME PAGE */
+        .hero {
+            text-align: center;
+            padding: 4px 0 2px;
+        }
+        .hero h1 { font-size: 24px; margin-bottom: 2px; }
+        .hero h1 span { color: var(--pp-accent); }
+        .hero p { font-size: 12px; color: #aaa; }
+
+        .status-card {
+            background: var(--pp-card);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 10px 14px;
+            max-width: 420px;
+            width: 100%;
+            margin: 0 auto;
+            text-align: center;
+            font-size: 13px;
+            flex-shrink: 0;
+        }
+        /* WhoAmI info card — shows MAC/IP/Token for the calling device */
+        .whoami-card {
+            background: var(--pp-card);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 10px;
+            padding: 8px 14px;
+            max-width: 420px;
+            width: 100%;
+            margin: 0 auto;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+        .whoami-card .whoami-title {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.35);
+            margin-bottom: 5px;
+        }
+        .whoami-card .whoami-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+            font-family: 'Consolas', 'Courier New', monospace;
+            color: rgba(255,255,255,0.55);
+        }
+        .whoami-card .whoami-row span:first-child { color: rgba(255,255,255,0.35); }
+        .whoami-card .whoami-row span:last-child  { color: rgba(255,255,255,0.7); }
+        .status-indicator {
+            width: 12px; height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+        .status-online { background: #00ff88; box-shadow: 0 0 10px #00ff88; }
+        .status-offline { background: #ff4444; box-shadow: 0 0 10px #ff4444; animation: none; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* COIN SLOT */
+        .coin-section {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+            max-width: 700px;
+            margin: 12px auto;
+        }
+        .coin-btn {
+            background: linear-gradient(145deg, var(--pp-primary), #16213e);
+            border: 2px solid var(--pp-accent);
+            border-radius: 12px;
+            padding: 14px 12px;
+            text-align: center;
+            cursor: pointer;
+            transition: 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+        .coin-btn:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(255, 215, 0, 0.3);
+        }
+        .coin-btn:active { transform: scale(0.95); }
+        .coin-icon {
+            width: 44px; height: 44px;
+            border-radius: 50%;
+            background: linear-gradient(145deg, #ffd700, #ffaa00);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 8px;
+            font-size: 17px;
+            font-weight: bold;
+            color: #333;
+        }
+        .coin-btn h3 { color: var(--pp-accent); font-size: 16px; }
+        .coin-btn p { color: #aaa; font-size: 12px; margin-top: 4px; }
+        /* Shown when the operator has no pricing tiers, or the API is unreachable */
+        .pricing-empty {
+            max-width: 700px;
+            margin: 12px auto;
+            padding: 16px 12px;
+            text-align: center;
+            color: #aaa;
+            font-size: 13px;
+            border: 1px dashed #444;
+            border-radius: 12px;
+        }
+
+        .btn {
+            padding: 11px 24px;
+            border: none;
+            border-radius: 22px;
+            font-size: 14px;
+            min-height: 44px;  /* thumb-friendly touch target */
+            cursor: pointer;
+            transition: 0.3s;
+            margin: 4px;
+        }
+        .btn-primary { background: #00d4ff; color: #000; }
+        .btn-primary:hover { background: #00b8e6; }
+        .btn-danger { background: #ff4444; color: #fff; }
+        .btn-danger:hover { background: #cc0000; }
+        .btn-success { background: #00ff88; color: #000; }
+        .btn-success:hover { background: #00cc6a; }
+        .btn-warning { background: #ffd700; color: #000; }
+        .btn-warning:hover { background: #e6c200; }
+
+        /* MODAL */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            padding: 16px;
+        }
+        .modal-overlay.active { display: flex; }
+        /* Modals are capped to the visible viewport; only the list area
+           inside them scrolls, so close buttons stay reachable. */
+        .modal {
+            background: var(--pp-primary);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            max-width: 400px;
+            width: 100%;
+            max-height: calc(100vh - 32px);
+            max-height: calc(100dvh - 32px);
+            display: flex;
+            flex-direction: column;
+            animation: modalIn 0.3s ease;
+        }
+        @keyframes modalIn {
+            from { transform: scale(0.8); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+        .modal h2 { margin-bottom: 10px; color: var(--pp-accent); font-size: 20px; }
+        .modal p { color: #aaa; margin-bottom: 14px; font-size: 13px; }
+
+        /* RATES MODAL (pricing tiers from /api/pricing) — informational
+           list only: rows are NOT clickable, payment is at the coin slot */
+        .rates-modal .coin-section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-width: none;
+            margin: 6px 0;
+            min-height: 0;
+            overflow-y: auto;  /* only the tier list scrolls */
+        }
+        .rate-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 11px 14px;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.03);
+        }
+        .rate-row .rate-coin { color: var(--pp-accent); font-weight: 700; font-size: 15px; }
+        .rate-row .rate-time { color: #ccc; font-size: 13px; }
+        .rates-modal .pricing-empty { margin: 12px 0; }
+
+        /* DESKTOP (phone-first: scale up a little on larger screens) */
+        @media (min-width: 768px) {
+            .navbar { padding: 12px 30px; }
+            .navbar .logo { font-size: 18px; }
+            .nav-links a { font-size: 15px; }
+            .page { max-width: 640px; }
+            .hero h1 { font-size: 34px; }
+            .hero p { font-size: 15px; }
+            .status-card { font-size: 14px; padding: 14px 18px; }
+        }
+
+        /* NOTIFICATION */
+        .notification {
+            position: fixed;
+            top: 56px;
+            right: 12px;
+            max-width: calc(100vw - 24px);
+            padding: 12px 18px;
+            border-radius: 10px;
+            font-size: 14px;
+            color: #fff;
+            font-weight: bold;
+            z-index: 2000;
+            animation: slideIn 0.3s ease, slideOut 0.3s ease 2.7s;
+            display: none;
+        }
+        .notification.success { background: #00cc6a; }
+        .notification.error { background: #ff4444; }
+        .notification.info { background: #00d4ff; color: #000; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        @keyframes slideOut { from { opacity: 1; } to { opacity: 0; } }
+
+        /* GPIO LISTENER MODAL */
+        .gpio-modal .modal {
+            max-width: 400px;
+            padding: 18px;
+        }
+        .gpio-countdown-ring {
+            width: 90px; height: 90px;
+            border-radius: 50%;
+            border: 4px solid rgba(255,255,255,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 12px;
+            position: relative;
+            flex-shrink: 0;
+        }
+        .gpio-countdown-ring svg {
+            position: absolute;
+            top: -4px; left: -4px;
+            width: 98px; height: 98px;
+            transform: rotate(-90deg);
+        }
+        .gpio-countdown-ring svg circle {
+            fill: none;
+            stroke-width: 5;
+            stroke-linecap: round;
+        }
+        .gpio-countdown-ring svg circle.bg { stroke: rgba(255,255,255,0.1); }
+        .gpio-countdown-ring svg circle.fg {
+            stroke: #00d4ff;
+            stroke-dasharray: 345.58;
+            stroke-dashoffset: 0;
+            transition: stroke-dashoffset 1s linear;
+        }
+        .gpio-countdown-number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #00d4ff;
+            z-index: 1;
+        }
+        .gpio-status {
+            font-size: 13px;
+            color: #aaa;
+            margin-bottom: 10px;
+            min-height: 18px;
+        }
+        .gpio-status.detecting { color: #ffd700; }
+        .gpio-status.detected { color: #00ff88; }
+        .gpio-coin-display {
+            background: rgba(255,215,0,0.1);
+            border: 1px solid rgba(255,215,0,0.3);
+            border-radius: 10px;
+            padding: 10px;
+            margin: 10px 0;
+            display: none;
+            min-height: 0;
+            overflow-y: auto;  /* shrinks + scrolls if the modal is height-capped */
+        }
+        .gpio-coin-display.active { display: block; }
+        .gpio-coin-list {
+            max-height: 80px;
+            overflow-y: auto;  /* coin log scrolls, buttons stay put */
+            margin-top: 8px;
+        }
+        .gpio-coin-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 8px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 13px;
+            animation: coinSlideIn 0.3s ease;
+        }
+        @keyframes coinSlideIn {
+            from { transform: translateX(-20px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .gpio-total-time {
+            font-size: 22px;
+            font-weight: bold;
+            color: var(--pp-accent);
+            font-family: 'Courier New', monospace;
+            margin: 6px 0;
+        }
+
+        /* MAIN SCREEN RUNNING TIMER */
+        .running-timer-bar {
+            display: none;
+            background: rgba(0,212,255,0.1);
+            border: 1px solid rgba(0,212,255,0.3);
+            border-radius: 10px;
+            padding: 8px 14px;
+            max-width: 420px;
+            width: 100%;
+            margin: 0 auto;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        .running-timer-bar.active { display: block; }
+        .running-timer-label {
+            font-size: 10px;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .running-timer-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00d4ff;
+            font-family: 'Courier New', monospace;
+            text-shadow: 0 0 15px rgba(0,212,255,0.4);
+        }
+        .running-timer-value span { color: var(--pp-accent); }
+
+        /* UNIFORM BUTTON SIZING — every portal action button shares the
+           same footprint; each has its own vivid color. */
+        .insert-coin-main-btn, .pause-resume-btn, .rates-btn, #voucherRedeemBtn {
+            padding: 13px 30px;   /* >=44px tall touch target */
+            font-size: 17px;
+            font-weight: bold;
+            border-radius: 26px;
+            min-width: 150px;
+            justify-content: center;
+            margin: 0;
+        }
+        /* Action buttons sit together in one compact, wrapping row. */
+        .action-btn-row {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            margin: 4px auto 0;
+            flex-shrink: 0;
+        }
+
+        /* INSERT COIN MAIN BUTTON (gold gradient) */
+        .insert-coin-main-btn {
+            background: var(--pp-btn);
+            color: var(--pp-btn-text);
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            animation: glowPulse 2s infinite;
+        }
+        .insert-coin-main-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 40px rgba(255,215,0,0.5);
+        }
+        .insert-coin-main-btn:active { transform: scale(0.95); }
+        @keyframes glowPulse {
+            0%, 100% { box-shadow: 0 0 10px rgba(255,215,0,0.3); }
+            50% { box-shadow: 0 0 30px rgba(255,215,0,0.6); }
+        }
+        .coin-slot-icon {
+            width: 24px; height: 24px;
+            border: 2px solid #000;
+            border-radius: 4px;
+            position: relative;
+            display: inline-block;
+        }
+        .coin-slot-icon::after {
+            content: '';
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 12px; height: 3px;
+            background: #000;
+            border-radius: 2px;
+        }
+
+        /* BAN OVERLAY */
+        .ban-badge {
+            display: none;
+            background: #ff4444;
+            color: #fff;
+            border-radius: 12px;
+            padding: 6px 16px;
+            font-size: 13px;
+            font-weight: bold;
+            text-align: center;
+            margin: 6px auto 2px;
+            max-width: 260px;
+        }
+        .ban-badge.active { display: block; }
+        .insert-coin-main-btn.banned {
+            opacity: 0.4;
+            pointer-events: none;
+            animation: none;
+        }
+
+        /* PAYING OVERLAY — shown when another device on the same VLAN
+           is mid-payment (HTTP 423 / code:"paying"). Sits over the
+           INSERT COIN button area with a red warning style. */
+        .paying-overlay {
+            display: none;
+            background: #ff4444;
+            color: #fff;
+            border-radius: 12px;
+            padding: 10px 18px;
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin: 6px auto 2px;
+            max-width: 320px;
+            animation: slideIn 0.3s ease;
+        }
+        .paying-overlay.active { display: block; }
+
+        /* PAUSE / RESUME BUTTON — same size as Insert Coin, orange color */
+        .pause-resume-btn {
+            background: #f39c12;
+            color: #000;
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+            display: none;
+            align-items: center;
+            gap: 8px;
+        }
+        .pause-resume-btn:hover {
+            background: #e08e0b;
+            transform: scale(1.05);
+            box-shadow: 0 10px 40px rgba(243,156,18,0.5);
+        }
+        .pause-resume-btn:active { transform: scale(0.95); }
+        .pause-resume-btn.active { display: inline-flex; }
+        .pause-resume-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+
+        /* RATES BUTTON — same size as Insert Coin, teal color */
+        .rates-btn {
+            background: #00bcd4;
+            color: #000;
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .rates-btn:hover {
+            background: #00a5bb;
+            transform: scale(1.05);
+            box-shadow: 0 10px 40px rgba(0,188,212,0.5);
+        }
+        .rates-btn:active { transform: scale(0.95); }
+
+        /* VOUCHER BUTTON — same size as the others, vivid violet */
+        #voucherRedeemBtn {
+            background: linear-gradient(145deg, #ab47bc, #7b1fa2);
+            color: #fff;
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+            white-space: nowrap;
+        }
+        #voucherRedeemBtn:hover {
+            background: linear-gradient(145deg, #ba68c8, #8e24aa);
+            transform: scale(1.05);
+            box-shadow: 0 10px 40px rgba(171,71,188,0.5);
+        }
+        #voucherRedeemBtn:active { transform: scale(0.95); }
+
+        /* PAUSED OVERLAY on timer card */
+        .paused-overlay {
+            display: none;
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            border-radius: 12px;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            font-weight: bold;
+            color: #ffd700;
+            letter-spacing: 2px;
+            z-index: 2;
+        }
+        .paused-overlay.active { display: flex; }
+        .running-timer-bar { position: relative; }
+
+        /* IMAGE UPLOAD CARD */
+        .upload-card {
+            transition: all 0.3s;
+        }
+        .upload-area {
+            border: 2px dashed rgba(0,212,255,0.3);
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            background: rgba(0,212,255,0.05);
+            transition: border 0.3s, background 0.3s;
+            position: relative;
+            min-height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .upload-area:hover {
+            border-color: #00d4ff;
+            background: rgba(0,212,255,0.1);
+        }
+        .upload-placeholder {
+            pointer-events: none;
+        }
+        .image-preview {
+            max-width: 100%;
+            max-height: 200px;
+            border-radius: 8px;
+            object-fit: contain;
+        }
+        .upload-progress {
+            animation: fadeIn 0.3s ease;
+        }
+        .upload-result {
+            animation: fadeIn 0.3s ease;
+        }
+        .upload-result.success {
+            background: rgba(0,255,136,0.1);
+            border: 1px solid rgba(0,255,136,0.3);
+            color: #00ff88;
+        }
+        .upload-result.error {
+            background: rgba(255,68,68,0.1);
+            border: 1px solid rgba(255,68,68,0.3);
+            color: #ff4444;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- NAVBAR -->
+    <nav class="navbar">
+        <div class="logo">Air<span>Coins</span></div>
+        <div class="nav-links">
+            <a class="active">Home</a>
+            <a href="admin.html">Admin</a>
+        </div>
+    </nav>
+
+    <!-- NOTIFICATION -->
+    <div class="notification" id="notification"></div>
+
+    <!-- HOME PAGE -->
+    <div class="page active" id="page-home">
+        <!-- PORTAL HEADER IMAGE -->
+        <div class="portal-header-image" id="portalHeaderImage" style="margin-bottom: 20px; display: none;">
+            <img id="headerImage" src="" alt="Portal Header" style="width: 100%; max-height: 300px; border-radius: 12px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1);">
+        </div>
+        
+        <div class="hero">
+            <h1>Welcome to <span>AirCoins</span></h1>
+            <p>Fast & affordable PisoNet. Insert coins and get connected instantly!</p>
+        </div>
+
+        <div class="status-card">
+            <p><span class="status-indicator status-online" id="systemStatus"></span> <strong id="statusText">System Online</strong></p>
+        </div>
+
+        <div class="whoami-card" id="whoamiCard">
+            <div class="whoami-title">WhoAmI</div>
+            <div class="whoami-row"><span>MAC</span><span id="whoamiMAC">—</span></div>
+            <div class="whoami-row"><span>IP</span><span id="whoamiIP">—</span></div>
+            <div class="whoami-row"><span>Token</span><span id="whoamiToken">—</span></div>
+        </div>
+
+        <!-- SESSION STATUS CARD (shown while /api/session/status reports an active session) -->
+        <div class="running-timer-bar" id="runningTimerBar">
+            <div class="paused-overlay" id="pausedOverlay">&#9208; PAUSED</div>
+            <div class="running-timer-label">Time Remaining</div>
+            <div class="running-timer-value" id="runningTimerValue">00:00:00</div>
+            <div style="font-size:12px; color:#aaa; margin-top:5px;">
+                HH:MM:SS &nbsp;|&nbsp; Total Paid: <span id="runningTotalCoins" style="color:#00ff88;">₱0</span>
+                &nbsp;|&nbsp; Status: <span id="sessionStatus" style="color:#00ff88;">Connected</span>
+            </div>
+        </div>
+
+        <!-- ACTION BUTTONS — one compact row, all same size, each its own color -->
+        <div style="flex-shrink:0;">
+            <div class="action-btn-row">
+                <button class="insert-coin-main-btn" id="insertCoinBtn" onclick="openGpioModal()">
+                    <span class="coin-slot-icon"></span>
+                    INSERT COIN
+                </button>
+                <button class="pause-resume-btn" id="pauseResumeBtn" onclick="togglePauseResume()">&#9208; Pause</button>
+                <button class="rates-btn" onclick="openRatesModal()">View Rates</button>
+            </div>
+            <div class="paying-overlay" id="payingOverlay">SOMEBODY IS PAYING, PLEASE WAIT FOR YOUR TURN</div>
+            <div class="ban-badge" id="banBadge">Banned</div>
+
+            <!-- VOUCHER REDEEM -->
+            <div class="status-card" style="margin-top:12px; text-align:left;">
+                <p style="margin-bottom:8px; color:#aaa; font-size:13px;">Have a voucher? Enter your code:</p>
+                <div style="display:flex; gap:8px;">
+                    <input type="text" id="voucherInput" maxlength="6" placeholder="XXXXXX"
+                           style="flex:1; min-width:0; text-transform:uppercase; letter-spacing:3px; font-family:monospace; font-size:16px; padding:10px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.06); color:#fff; text-align:center;"
+                           autocomplete="off" spellcheck="false">
+                    <button class="btn btn-primary" id="voucherRedeemBtn" onclick="redeemVoucher()" style="white-space:nowrap;">Use Voucher</button>
+                </div>
+            </div>
+
+
+        </div>
+    </div>
+
+    <!-- POST-PAYMENT CONNECTION READY MODAL (shown when redirect_url is set) -->
+        <div class="modal-overlay" id="postPayModal" style="display:none;">
+            <div class="modal">
+                <h2 style="color:#4caf50;">&#10003; Connected</h2>
+                <p>Your internet is now active. You can browse the web, or tap below to open the provided link.</p>
+                <a id="postPayLink" href="#" target="_blank" rel="noopener"
+                   class="btn btn-primary" style="display:inline-block; width:100%; text-align:center; padding:12px; box-sizing:border-box; text-decoration:none; margin-top:6px;">Open Link</a>
+                <button class="btn btn-ghost" onclick="closePostPay()" style="width:100%; margin:10px 0 0;">I'll Browse Myself</button>
+            </div>
+        </div>
+
+        <!-- RATES MODAL (pricing tiers from the admin Pricing page) -->
+    <div class="modal-overlay rates-modal" id="ratesModal">
+        <div class="modal">
+            <h2>Rates</h2>
+            <p style="margin-bottom:6px;">Coin denominations and the time they credit.</p>
+            <!-- Rendered from /api/pricing by renderPricingCards() -->
+            <div class="coin-section" id="pricingCardsRates" style="display:none;"></div>
+            <div class="pricing-empty" id="pricingEmptyRates">Loading rates&hellip;</div>
+            <button class="btn btn-primary" onclick="closeRatesModal()" style="width:100%; margin:10px 0 0;">Close</button>
+        </div>
+    </div>
+
+    <!-- TIME WARNING MODAL -->
+    <div class="modal-overlay" id="warningModal">
+        <div class="modal">
+            <h2 style="color:#ff4444;">⏰ Time Running Out!</h2>
+            <p id="warningText">You have less than 1 minute remaining. Insert more coins to continue.</p>
+            <button class="btn btn-warning" onclick="closeWarningModal()">Insert More Coins</button>
+        </div>
+    </div>
+
+
+
+    <!-- GPIO COIN LISTENER MODAL -->
+    <div class="modal-overlay gpio-modal" id="gpioModal">
+        <div class="modal">
+            <h2 style="margin-bottom:4px;">Insert Coins</h2>
+            <p style="font-size:13px; color:#666; margin-bottom:8px;">Waiting for coin insertion...</p>
+
+            <!-- 60s Countdown Ring -->
+            <div class="gpio-countdown-ring">
+                <svg viewBox="0 0 120 120">
+                    <circle class="bg" cx="60" cy="60" r="55"></circle>
+                    <circle class="fg" id="gpioCountdownCircle" cx="60" cy="60" r="55"></circle>
+                </svg>
+                <span class="gpio-countdown-number" id="gpioCountdownNum">60</span>
+            </div>
+
+            <!-- Status -->
+            <div class="gpio-status detecting" id="gpioStatus">Listening for coin...</div>
+
+            <!-- Coin Display -->
+            <div class="gpio-coin-display" id="gpioCoinDisplay">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="color:#aaa; font-size:13px;">Coins Inserted</span>
+                    <span style="color:#ffd700; font-weight:bold; font-size:18px;" id="gpioCoinTotal">₱0</span>
+                </div>
+                <div class="gpio-total-time" id="gpioTotalTime">00:00:00</div>
+                <div style="font-size:11px; color:#aaa;">Total Time (HH:MM:SS)</div>
+                <div class="gpio-coin-list" id="gpioCoinList"></div>
+            </div>
+
+            <!-- Cancel Button (always visible) -->
+            <button class="btn btn-danger" onclick="gpioCancel()" style="width:100%; margin:10px 0 0; flex-shrink:0;">
+                Cancel
+            </button>
+
+            <!-- Done Paying Button (shown after coins inserted) -->
+            <button class="btn btn-success" id="gpioDoneBtn" onclick="gpioDonePaying()" style="width:100%; margin:10px 0 0; flex-shrink:0; display:none;">
+                Done Paying
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // ==================== STATE ====================
+        // The session fields below are a DISPLAY MIRROR of the server's
+        // session (GET /api/session/status). The server owns the session:
+        // it credits coins, opens/closes internet access and enforces
+        // expiry. Nothing session-related is persisted locally.
+        let state = {
+            systemOnline: true,
+            sessionActive: false,
+            sessionPaused: false,
+            totalSeconds: 0,
+            remainingSeconds: 0,
+            coinsInserted: 0,
+            timerInterval: null,
+            banUntil: null,     // ISO string when ban expires
+            banTimer: null,     // interval ID for ban countdown
+            // Pricing tiers fetched from /api/pricing: { coinValue: minutes }.
+            // Empty is normal — the operator configures every tier manually.
+            // The backend is authoritative; this copy is display only.
+            pricing: {},
+            pricingLoaded: false,
+            // GPIO Configuration
+            gpioPin: 7,
+            gpioCoinValue: 1,
+            gpioPulseMode: 'falling'
+        };
+
+        // Load state from localStorage
+        function loadState() {
+            try {
+                const saved = localStorage.getItem('aircoins_state');
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    // Pricing is deliberately NOT restored from localStorage —
+                    // /api/pricing is the only source of tiers.
+                    state.gpioPin = parsed.gpioPin || 7;
+                    state.gpioCoinValue = parsed.gpioCoinValue || 1;
+                    state.gpioPulseMode = parsed.gpioPulseMode || 'falling';
+                }
+            } catch (e) {}
+        }
+
+        function saveState() {
+            try {
+                localStorage.setItem('aircoins_state', JSON.stringify({
+                    gpioPin: state.gpioPin,
+                    gpioCoinValue: state.gpioCoinValue,
+                    gpioPulseMode: state.gpioPulseMode
+                }));
+            } catch (e) {}
+        }
+
+        // ==================== SESSION TOKEN ====================
+        // Returns the 8-hex-char token stored in localStorage that the
+        // backend uses to link sessions across page reloads and device
+        // reboots. If no token exists yet, generates one via
+        // crypto.getRandomValues and persists it. Falls back to "" when
+        // storage is unavailable (private browsing, quota exceeded).
+        function getSessionToken() {
+            try {
+                // Try localStorage first
+                var tok = localStorage.getItem('aircoins_session_token');
+                if (tok) return tok;
+                // Try cookie fallback (survives WiFi forget on most browsers)
+                var match = document.cookie.match(/aircoins_token=([^;]+)/);
+                if (match) {
+                    tok = match[1];
+                    try { localStorage.setItem('aircoins_session_token', tok); } catch (e) {}
+                    return tok;
+                }
+                // Generate new token
+                var buf = new Uint8Array(4);
+                crypto.getRandomValues(buf);
+                tok = Array.from(buf).map(function(b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+                storeSessionToken(tok);
+                return tok;
+            } catch (e) {
+                return '';
+            }
+        }
+
+        function storeSessionToken(tok) {
+            if (!tok) return;
+            try { localStorage.setItem('aircoins_session_token', tok); } catch (e) {}
+            // Also store in cookie (survives WiFi forget on most browsers)
+            document.cookie = "aircoins_token=" + tok + "; path=/; max-age=31536000; SameSite=Lax";
+            updateDebugToken();
+        }
+
+        // ==================== DEBUG TOKEN DISPLAY ====================
+        function updateDebugToken() {
+            var el = document.getElementById('debugTokenValue');
+            if (!el) return;
+            try {
+                var tok = localStorage.getItem('aircoins_session_token');
+                el.textContent = tok || '(none)';
+            } catch (e) {
+                el.textContent = '(unavailable)';
+            }
+        }
+
+        // ==================== COIN INSERT ====================
+        // Payment happens ONLY at the PHYSICAL coin slot. The Rates modal
+        // is a plain informational list — there is no per-rate button and
+        // nothing to tap. The main Insert Coin button calls openGpioModal().
+
+        // ==================== TIMER ====================
+        // Smooth 1s countdown between server syncs (apiPoll re-aligns
+        // remainingSeconds with the server every few seconds).
+        function startTimer() {
+            if (state.timerInterval) clearInterval(state.timerInterval);
+            state.timerInterval = setInterval(() => {
+                if (state.remainingSeconds <= 0) {
+                    clearInterval(state.timerInterval);
+                    sessionExpired();
+                    return;
+                }
+                state.remainingSeconds--;
+
+                // Warning at 60 seconds
+                if (state.remainingSeconds === 60) {
+                    document.getElementById('warningModal').classList.add('active');
+                }
+
+                updateTimerDisplay();
+            }, 1000);
+            updateTimerDisplay();
+        }
+
+        function updateTimerDisplay() {
+            // The home session card is the only remaining-time display.
+            updateRunningTimerDisplay();
+        }
+
+        // Shows the compact session card on Home while a session is active,
+        // and hides it in the idle state.
+        function updateSessionView() {
+            const bar = document.getElementById('runningTimerBar');
+            if (state.sessionActive && state.remainingSeconds > 0) {
+                bar.classList.add('active');
+            } else {
+                bar.classList.remove('active');
+            }
+        }
+
+        // Clears the local display mirror. The REAL session lives on the
+        // server — this only resets what the user sees.
+        function clearLocalSession() {
+            if (state.timerInterval) clearInterval(state.timerInterval);
+            if (gpio.sessionInterval) clearInterval(gpio.sessionInterval);
+
+            state.sessionActive = false;
+            state.sessionPaused = false;
+            state.remainingSeconds = 0;
+            state.totalSeconds = 0;
+            state.coinsInserted = 0;
+
+            updateSessionView();
+            document.getElementById('runningTimerBar').classList.remove('active');
+            document.getElementById('pausedOverlay').classList.remove('active');
+            document.getElementById('pauseResumeBtn').classList.remove('active');
+        }
+
+        // The server expired (or terminated) the session: show the
+        // disconnected state.
+        function sessionExpired() {
+            const wasActive = state.sessionActive;
+            clearLocalSession();
+            document.getElementById('sessionStatus').textContent = 'Disconnected';
+            document.getElementById('sessionStatus').style.color = '#ff4444';
+            if (wasActive) {
+                showNotification('Session expired. Insert coins to continue.', 'info');
+            }
+        }
+
+        function addMoreTime() {
+            openGpioModal();
+        }
+
+        // ==================== MODALS ====================
+        function openRatesModal() {
+            renderPricingCards();
+            document.getElementById('ratesModal').classList.add('active');
+        }
+
+        function closeRatesModal() {
+            document.getElementById('ratesModal').classList.remove('active');
+        }
+
+        function closeWarningModal() {
+            document.getElementById('warningModal').classList.remove('active');
+            addMoreTime();
+        }
+
+        // ==================== NOTIFICATIONS ====================
+        function showNotification(msg, type) {
+            const notif = document.getElementById('notification');
+            notif.textContent = msg;
+            notif.className = 'notification ' + type;
+            notif.style.display = 'block';
+            setTimeout(() => { notif.style.display = 'none'; }, 3000);
+        }
+
+        // ==================== INIT ====================
+        // GPIO state (declared early so init can reference it)
+        let gpio = {
+            countdownInterval: null,
+            countdown: 60,
+            expiresAt: 0,
+            statusInterval: null,
+            coins: [],
+            lastCoinId: 0,
+            totalAmount: 0,
+            totalSeconds: 0,
+            active: false,
+            sessionStartTime: null,
+            sessionInterval: null,
+            payTicket: '',
+            coinslot: 'auto',
+            // The coinslot the SERVER actually armed (from the /arm response),
+            // e.g. 'gpio'. Sticky so status/start always target the same slot
+            // that was armed.
+            activeCoinslot: ''
+        };
+
+        // ==================== API HELPERS ====================
+        // lighttpd's server.error-handler-404 serves /index.html for ANY
+        // unknown path, so a wrong URL answers HTTP 200 with the portal's
+        // own HTML instead of failing. r.json() then throws a parse error
+        // that a bare .catch() swallows and the portal goes silently blind.
+        // Every JSON poll goes through here so that case is loud instead.
+        function fetchJSON(url) {
+            return fetch(url, { headers: { 'Accept': 'application/json', 'X-Session-Token': getSessionToken() } })
+                .then(r => {
+                    if (!r.ok) throw new Error(url + ' -> HTTP ' + r.status);
+                    const ctype = (r.headers.get('content-type') || '').toLowerCase();
+                    if (ctype.indexOf('json') === -1) {
+                        throw new Error(url + ' -> non-JSON response (' +
+                            (ctype || 'no content-type') +
+                            '); path probably served by the captive-portal 404 fallback');
+                    }
+                    return r.json();
+                });
+        }
+
+        // Polls run every few seconds; log each distinct failure once so a
+        // broken endpoint is visible in the console without flooding it.
+        const warnedOnce = {};
+        function warnOnce(key, err) {
+            if (warnedOnce[key]) return;
+            warnedOnce[key] = true;
+            console.warn('[AirCoins] ' + key + ': ' + ((err && err.message) || err));
+        }
+
+        // ==================== PRICING (/api/pricing) ====================
+        const PRICING_URL = '/api/pricing';
+        const PRICING_REFRESH_INTERVAL = 60000;  // re-read tiers once a minute
+
+        // Mirrors the backend tiered credit: find the highest configured tier
+        // at or below the amount, then SCALE it proportionally for any excess
+        // beyond that tier. E.g. only a P10=300min tier exists and the total
+        // is P20 -> 20/10 * 300 = 600 min. Informational only — the backend
+        // decides what actually gets credited.
+        function minutesForAmount(amount) {
+            const coin = parseInt(amount, 10);
+            if (!coin || coin <= 0) return 0;
+
+            let bestTier = 0;
+            let bestMinutes = 0;
+            Object.keys(state.pricing).forEach(key => {
+                const tier = parseInt(key, 10);
+                if (tier > 0 && tier <= coin && tier > bestTier) {
+                    bestTier = tier;
+                    bestMinutes = state.pricing[key];
+                }
+            });
+
+            if (bestTier <= 0 || bestMinutes <= 0) return 0;
+            return Math.floor((coin * bestMinutes) / bestTier);
+        }
+
+        function formatMinutes(mins) {
+            if (!mins || mins <= 0) return 'No rate configured';
+            if (mins < 60) return mins + ' Minute' + (mins === 1 ? '' : 's');
+            const hrs = Math.floor(mins / 60);
+            const rem = mins % 60;
+            let text = hrs + ' Hour' + (hrs > 1 ? 's' : '');
+            if (rem > 0) text += ' ' + rem + ' Min';
+            return text;
+        }
+
+        // Rebuilds the coin cards inside the Rates modal from the tiers
+        // currently in state.pricing. An empty table is a valid state.
+        function renderPricingCards() {
+            const tiers = Object.keys(state.pricing)
+                .map(key => parseInt(key, 10))
+                .filter(coin => coin > 0)
+                .sort((a, b) => a - b);
+
+            ['Rates'].forEach(page => {
+                const grid = document.getElementById('pricingCards' + page);
+                const empty = document.getElementById('pricingEmpty' + page);
+                if (!grid || !empty) return;
+
+                grid.innerHTML = '';
+
+                if (tiers.length === 0) {
+                    grid.style.display = 'none';
+                    empty.style.display = 'block';
+                    empty.textContent = state.pricingLoaded
+                        ? 'No rates configured. Please ask the operator to set up pricing.'
+                        : 'Rates unavailable right now.';
+                    return;
+                }
+
+                empty.style.display = 'none';
+                grid.style.display = 'grid';
+
+                tiers.forEach(coin => {
+                    // Informational list row — NOT a button, NOT clickable.
+                    // Payment happens at the physical coin slot.
+                    const row = document.createElement('div');
+                    row.className = 'rate-row';
+
+                    const coinLabel = document.createElement('span');
+                    coinLabel.className = 'rate-coin';
+                    coinLabel.textContent = '₱' + coin;
+
+                    const timeLabel = document.createElement('span');
+                    timeLabel.className = 'rate-time';
+                    timeLabel.textContent = formatMinutes(state.pricing[coin]);
+
+                    row.appendChild(coinLabel);
+                    row.appendChild(timeLabel);
+                    grid.appendChild(row);
+                });
+            });
+        }
+
+        // Fetch the operator's real tiers. Never rejects: when the API is not
+        // reachable (file:// preview, backend down) the portal just shows a
+        // placeholder instead of stale demo pricing.
+        function loadPricing() {
+            return fetchJSON(PRICING_URL + '?t=' + Date.now())
+                .then(res => {
+                    const rows = (res && Array.isArray(res.data)) ? res.data : [];
+                    const tiers = {};
+                    rows.forEach(row => {
+                        const coin = parseInt(row.coin_value, 10);
+                        const mins = parseInt(row.minutes, 10);
+                        if (coin > 0 && mins > 0 && row.active !== false) {
+                            tiers[coin] = mins;
+                        }
+                    });
+                    state.pricing = tiers;
+                    state.pricingLoaded = true;
+                })
+                .catch(err => {
+                    warnOnce('pricing', err);
+                    state.pricing = {};
+                    state.pricingLoaded = false;
+                })
+                .then(renderPricingCards);
+        }
+
+        loadState();
+        loadPricing();
+        setInterval(loadPricing, PRICING_REFRESH_INTERVAL);
+
+        // ==================== PORTAL APPEARANCE ====================
+        // Theme colors come from GET /api/portal/appearance (edited on the
+        // admin "Portal" page). The :root defaults ARE the dark theme, so
+        // on any failure or unexpected payload we silently keep the
+        // built-in look — the captive portal must never break or flash
+        // because the API is down.
+        const APPEARANCE_URL = '/api/portal/appearance';
+        const PP_HEX_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+        // Matches the backend rule: one safe filename directly under
+        // /portal-assets/. Anything else is ignored so an unexpected
+        // value can never be interpolated into the CSS url() below.
+        const PP_BG_RE = /^\/portal-assets\/[A-Za-z0-9._-]+$/;
+
+        function applyPortalAppearance() {
+            fetchJSON(APPEARANCE_URL + '?t=' + Date.now())
+                .then(res => {
+                    // Store the optional post-payment redirect target for
+                    // use after DONE PAYING / voucher redemption.
+                    (window._portalRedirect = (res.data && res.data.redirect_url) || '')
+                        && console.log('redirect_url configured');
+
+                    if (!res || !res.success || !res.data || !res.data.colors) return;
+                    const c = res.data.colors;
+                    const keys = ['primary', 'accent', 'background', 'card', 'text', 'button', 'button_text'];
+                    if (!keys.every(k => PP_HEX_RE.test(c[k] || ''))) return;
+
+                    const img = PP_BG_RE.test(res.data.background_image || '')
+                        ? res.data.background_image : '';
+
+                    // The :root defaults ARE the dark theme, with the legacy
+                    // gradients the hex-only API contract cannot express.
+                    // Dark without an image therefore changes nothing — the
+                    // portal stays pixel-identical to the built-in look.
+                    const isDark = res.data.theme === 'dark';
+                    if (isDark && !img) return;
+
+                    const rs = document.documentElement.style;
+                    if (!isDark) {
+                        rs.setProperty('--pp-primary', c.primary);
+                        rs.setProperty('--pp-accent', c.accent);
+                        rs.setProperty('--pp-card', c.card);
+                        rs.setProperty('--pp-text', c.text);
+                        rs.setProperty('--pp-btn', c.button);
+                        rs.setProperty('--pp-btn-text', c.button_text);
+                    }
+
+                    if (img) {
+                        // Cover image + dark overlay keeps the text readable
+                        rs.setProperty('--pp-bg',
+                            'linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0.55)), ' +
+                            'url("' + img + '") center / cover no-repeat, ' + c.background);
+                    } else {
+                        rs.setProperty('--pp-bg', c.background);
+                    }
+
+                    const headerImg = PP_BG_RE.test(res.data.header_image || '')
+                        ? res.data.header_image : '';
+                    const headerContainer = document.getElementById('portalHeaderImage');
+                    const headerImgEl = document.getElementById('headerImage');
+                    if (headerImg && headerContainer && headerImgEl) {
+                        headerImgEl.src = headerImg;
+                        headerContainer.style.display = 'block';
+                    } else if (headerContainer) {
+                        headerContainer.style.display = 'none';
+                    }
+                })
+                .catch(err => warnOnce('appearance', err));
+        }
+
+        applyPortalAppearance();
+
+        // No local session restore: the status poll below mirrors whatever
+        // session the server has for this client (survives page reloads).
+
+        // ==================== PORTAL AUDIO ====================
+        // Preload the three audio slots. If a slot 404s the element is inert.
+        var audioInsertCoin = new Audio('/audio/insertcoin');
+        var audioCoinDrop = new Audio('/audio/coindrop');
+        var audioDonePaying = new Audio('/audio/donepaying');
+        audioInsertCoin.preload = 'auto';
+        audioCoinDrop.preload = 'auto';
+        audioDonePaying.preload = 'auto';
+
+        function playAudioSafe(el) {
+            if (!el) return;
+            try {
+                el.currentTime = 0;
+                el.play().catch(function(){});
+            } catch (e) {}
+        }
+
+        function stopAudio(el) {
+            if (!el) return;
+            try { el.pause(); el.currentTime = 0; } catch (e) {}
+        }
+
+        function stopAllPortalAudio() {
+            stopAudio(audioInsertCoin);
+            stopAudio(audioCoinDrop);
+            stopAudio(audioDonePaying);
+        }
+
+        // ==================== GPIO COIN LISTENER ====================
+
+        // Coin slot arm/disarm API — the backend GPIO listener only
+        // polls the coin slot while the armed window is open.
+        const COINSLOT_ARM_SEC = 60;
+        const COINSLOT_ARM_URL = '/api/coinslot/arm';
+        const COINSLOT_DISARM_URL = '/api/coinslot/disarm';
+        const COINSLOT_STATUS_URL = '/api/coinslot/status';
+
+        function coinslotArm(durationSec) {
+            return fetch(COINSLOT_ARM_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Session-Token': getSessionToken() },
+                body: JSON.stringify({ duration_sec: durationSec, coinslot: gpio.coinslot || 'auto' })
+            }).then(r => r.json().then(body => {
+                // Lock onto the slot the server actually armed/locked ('gpio'),
+                // NOT just what we asked for. Every later poll/start must target
+                // this exact slot or the coins are credited under the wrong
+                // source and start fails.
+                if (body && body.coinslot) gpio.activeCoinslot = body.coinslot;
+                return { status: r.status, body: body };
+            })).catch(() => null);
+        }
+
+        function coinslotDisarm() {
+            const slot = gpio.activeCoinslot || gpio.coinslot || 'auto';
+            fetch(COINSLOT_DISARM_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ coinslot: slot })
+            }).catch(() => {});
+        }
+
+        // Poll coin slot status while the modal is open. The response carries
+        // both the armed window (countdown follows the backend's +30s per
+        // coin extensions) and every coin detected since arming, which is how
+        // the modal learns about real pulses: the GPIO listener POSTs each
+        // pulse to /api/gpio/coin, the API stores a coin_events row, and
+        // /api/coinslot/status reports the rows newer than the arm timestamp.
+        function pollCoinslotStatus() {
+            const slot = encodeURIComponent(gpio.activeCoinslot || gpio.coinslot || 'auto');
+            fetchJSON(COINSLOT_STATUS_URL + '?t=' + Date.now() + '&coinslot=' + slot)
+                .then(data => {
+                    if (!gpio.active || !data) return;
+
+                    if (data.armed && data.expires_at > gpio.expiresAt) {
+                        gpio.expiresAt = data.expires_at;
+                    }
+
+                    applyCoinslotCoins(data.coins_inserted);
+                })
+                .catch(err => warnOnce('coinslot status', err));
+        }
+
+        function startCoinslotStatusPolling() {
+            if (gpio.statusInterval) clearInterval(gpio.statusInterval);
+            pollCoinslotStatus();
+            gpio.statusInterval = setInterval(() => {
+                if (!gpio.active) {
+                    clearInterval(gpio.statusInterval);
+                    gpio.statusInterval = null;
+                    return;
+                }
+                pollCoinslotStatus();
+            }, 1000);
+        }
+
+        // Feeds the coins reported by the backend into the modal. Rows are
+        // ordered by id, so anything past the last id we rendered is new;
+        // the poll is therefore idempotent and never double-counts a coin.
+        function applyCoinslotCoins(summary) {
+            if (!summary || !Array.isArray(summary.coins)) return;
+
+            summary.coins.forEach(coin => {
+                const id = parseInt(coin && coin.id, 10) || 0;
+                if (id <= gpio.lastCoinId) return;
+                gpio.lastCoinId = id;
+                handleGpioCoin(parseInt(coin.value, 10) || 0, coin.minutes);
+            });
+
+            // The backend resolved the pricing tiers that actually get
+            // credited, so let its totals win over the local mirror.
+            if (typeof summary.total_value === 'number') {
+                gpio.totalAmount = summary.total_value;
+            }
+            if (typeof summary.total_seconds === 'number') {
+                gpio.totalSeconds = summary.total_seconds;
+            }
+            if (gpio.coins.length > 0) updateGpioCoinTotals();
+        }
+
+        // Sub-Vendo (NodeMCU) support was removed: the SBC's GPIO coin
+        // listener is the only coinslot, so there is no vendo picker and
+        // gpio.coinslot stays 'auto' (the server resolves it to GPIO).
+
+        function openGpioModal() {
+            if (!state.systemOnline) {
+                showNotification('System is currently offline!', 'error');
+                return;
+            }
+            // Reset GPIO state
+            gpio.countdown = 60;
+            gpio.coins = [];
+            gpio.lastCoinId = 0;
+            gpio.totalAmount = 0;
+            gpio.totalSeconds = 0;
+            gpio.payTicket = '';
+            gpio.activeCoinslot = '';
+            gpio.active = true;
+
+            // Reset UI
+            document.getElementById('gpioCountdownNum').textContent = '60';
+            document.getElementById('gpioCountdownCircle').style.strokeDashoffset = '0';
+            document.getElementById('gpioStatus').textContent = 'Listening for coin...';
+            document.getElementById('gpioStatus').className = 'gpio-status detecting';
+            document.getElementById('gpioCoinDisplay').classList.remove('active');
+            document.getElementById('gpioCoinList').innerHTML = '';
+            document.getElementById('gpioCoinTotal').textContent = '₱0';
+            document.getElementById('gpioTotalTime').textContent = '00:00:00';
+            document.getElementById('gpioDoneBtn').style.display = 'none';
+
+            // Open modal
+            document.getElementById('gpioModal').classList.add('active');
+
+            // Play insert-coin audio (user gesture from tap guarantees play() works)
+            playAudioSafe(audioInsertCoin);
+
+            // Arm the coin slot on the backend (GPIO listener wakes up).
+            // Local fallback expiry keeps the countdown working if the
+            // API is not reachable (dev/demo mode).
+            gpio.expiresAt = Math.floor(Date.now() / 1000) + COINSLOT_ARM_SEC;
+            coinslotArm(COINSLOT_ARM_SEC).then(data => {
+                if (!data) return;
+                // 423 or code:"paying" → another device is mid-payment.
+                if (data.status === 423 || (data.body && data.body.code === 'paying')) {
+                    closeGpioModal();
+                    showPayingMessage();
+                    return;
+                }
+                if (data.body && data.body.armed && data.body.expires_at) {
+                    gpio.expiresAt = data.body.expires_at;
+                }
+                // Stash the pay_ticket for the session Start call.
+                if (data.body && data.body.pay_ticket) {
+                    gpio.payTicket = data.body.pay_ticket;
+                }
+            });
+
+            // Start countdown driven by the armed window expiry
+            startGpioCountdown();
+            startCoinslotStatusPolling();
+        }
+
+        function startGpioCountdown() {
+            if (gpio.countdownInterval) clearInterval(gpio.countdownInterval);
+
+            gpio.countdown = Math.max(0, gpio.expiresAt - Math.floor(Date.now() / 1000));
+            updateGpioCountdownUI();
+
+            gpio.countdownInterval = setInterval(() => {
+                gpio.countdown = Math.max(0, gpio.expiresAt - Math.floor(Date.now() / 1000));
+                updateGpioCountdownUI();
+
+                if (gpio.countdown <= 0) {
+                    clearInterval(gpio.countdownInterval);
+                    closeGpioModal();
+                    showNotification('Coin slot timed out. No coin detected.', 'info');
+                }
+            }, 1000);
+        }
+
+        function updateGpioCountdownUI() {
+            document.getElementById('gpioCountdownNum').textContent = gpio.countdown;
+
+            // Update ring progress (circumference = 2 * PI * 55 = 345.58)
+            const circumference = 345.58;
+            const offset = Math.max(0, circumference - (gpio.countdown / 60) * circumference);
+            document.getElementById('gpioCountdownCircle').style.strokeDashoffset = offset;
+
+            // Change color when low
+            if (gpio.countdown <= 10) {
+                document.getElementById('gpioCountdownNum').style.color = '#ff4444';
+                document.getElementById('gpioCountdownCircle').style.stroke = '#ff4444';
+            } else {
+                document.getElementById('gpioCountdownNum').style.color = '#00d4ff';
+                document.getElementById('gpioCountdownCircle').style.stroke = '#00d4ff';
+            }
+        }
+
+        // Handle real GPIO coin detection from backend API.
+        // Credited minutes are tiered: resolved from the RUNNING TOTAL
+        // against the pricing table (highest tier at or below the total),
+        // mirroring the backend's credit logic.
+        function handleGpioCoin(amount, serverMinutes) {
+            if (!gpio.active) return;
+
+            // The GPIO listener extends the armed window +30s per coin;
+            // mirror that locally so the countdown doesn't cut off
+            const nowSec = Math.floor(Date.now() / 1000);
+            gpio.expiresAt = Math.max(gpio.expiresAt, nowSec + 30);
+            gpio.countdown = Math.max(0, gpio.expiresAt - nowSec);
+            updateGpioCountdownUI();
+
+            // Add coin. The portal mirrors the backend pricing rules — tiered
+            // credit: the running total is resolved against the pricing table
+            // (highest tier at or below the total), matching what the backend
+            // will actually credit. An unpriced coin is still listed, just
+            // without minutes.
+            gpio.totalAmount += amount;
+            const tierMinutes = minutesForAmount(gpio.totalAmount);
+            const prevSeconds = gpio.totalSeconds;
+            gpio.totalSeconds = tierMinutes * 60;
+            const deltaMin = Math.round((gpio.totalSeconds - prevSeconds) / 60);
+            gpio.coins.push({ amount: amount, minutes: deltaMin, time: new Date().toLocaleTimeString() });
+            const minutesText = deltaMin > 0
+                ? '+' + deltaMin + ' min'
+                : (tierMinutes > 0 ? 'total ' + tierMinutes + ' min' : 'no rate');
+
+            // Update coin display
+            updateGpioCoinTotals();
+
+            // Add to coin list
+            const listItem = document.createElement('div');
+            listItem.className = 'gpio-coin-item';
+            listItem.innerHTML = '<span style="color:#ffd700;">₱' + amount + '</span><span style="color:#aaa;">' + minutesText + '</span><span style="color:#666;">' + new Date().toLocaleTimeString() + '</span>';
+            document.getElementById('gpioCoinList').prepend(listItem);
+
+            // Update status
+            document.getElementById('gpioStatus').textContent = 'Coin detected! ₱' + amount + ' inserted';
+            document.getElementById('gpioStatus').className = 'gpio-status detected';
+
+            // Show done paying button
+            document.getElementById('gpioDoneBtn').style.display = 'block';
+
+            // Flash notification
+            showNotification('Coin detected! ₱' + amount + ' (' + minutesText + ')', 'success');
+
+            // Play coin-drop audio (reset + play for rapid successive coins)
+            playAudioSafe(audioCoinDrop);
+
+            // Brief status flash then back to listening
+            setTimeout(() => {
+                if (gpio.active) {
+                    document.getElementById('gpioStatus').textContent = 'Listening for next coin...';
+                    document.getElementById('gpioStatus').className = 'gpio-status detecting';
+                }
+            }, 2000);
+        }
+
+        // Renders the running totals of the armed window (peso total and the
+        // credited time as HH:MM:SS)
+        function updateGpioCoinTotals() {
+            document.getElementById('gpioCoinDisplay').classList.add('active');
+            document.getElementById('gpioCoinTotal').textContent = '₱' + gpio.totalAmount;
+
+            const totalHrs = Math.floor(gpio.totalSeconds / 3600);
+            const totalMins = Math.floor((gpio.totalSeconds % 3600) / 60);
+            const totalSecs = gpio.totalSeconds % 60;
+            document.getElementById('gpioTotalTime').textContent =
+                String(totalHrs).padStart(2, '0') + ':' +
+                String(totalMins).padStart(2, '0') + ':' +
+                String(totalSecs).padStart(2, '0');
+        }
+
+        // "Done Paying": ask the server to credit this armed window's coins
+        // and start (or extend) the session. The request carries NO body —
+        // the server sums its own unprocessed coin_events, so the client
+        // cannot grant itself time.
+        // F10: pre-flight check via /api/session/can-start — if someone else
+        // is paying we show the overlay immediately WITHOUT consuming the arm.
+        function gpioDonePaying() {
+            if (gpio.totalAmount <= 0) {
+                showNotification('No coins inserted yet!', 'error');
+                return;
+            }
+
+            // Freeze the modal while we check.
+            clearInterval(gpio.countdownInterval);
+            gpio.active = false;
+            document.getElementById('gpioStatus').textContent = 'Checking...';
+            document.getElementById('gpioStatus').className = 'gpio-status detecting';
+
+            // F10: lightweight peek — if lock is held, bail before calling Start.
+            fetch('/api/session/can-start', { headers: { 'Accept': 'application/json' } })
+                .then(r => r.json().catch(() => ({})))
+                .then(peek => {
+                    if (peek && peek.can_start === false) {
+                        closeGpioModal();
+                        showPayingMessage();
+                        return;
+                    }
+                    // Peek passed (or endpoint unavailable) — proceed to Start.
+                    doSessionStart();
+                })
+                .catch(() => {
+                    // Network error on peek — still try Start (it has its own 423 handling).
+                    doSessionStart();
+                });
+        }
+
+        // doSessionStart performs the actual POST /api/session/start after
+        // the can-start pre-flight (or if the pre-flight fails).
+        function doSessionStart(attempt) {
+            attempt = attempt || 1;
+            document.getElementById('gpioStatus').textContent = 'Starting session...' + (attempt > 1 ? ' (retry ' + attempt + ')' : '');
+            document.getElementById('gpioStatus').className = 'gpio-status detecting';
+
+            // Failsafe: never leave the modal hung at "Starting session..."
+            // if the request stalls or the server is slow. After 25s we give
+            // up, close, and let the operator retry.
+            var hung = setTimeout(function () {
+                closeGpioModal();
+                showNotification('Starting session timed out. Please try again.', 'error');
+            }, 25000);
+
+            var slot = gpio.activeCoinslot || gpio.coinslot || 'auto';
+            fetch(SESSION_START_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Session-Token': getSessionToken() },
+                body: JSON.stringify({ pay_ticket: gpio.payTicket || '', coinslot: slot })
+            })
+                .then(r => r.text().then(text => ({
+                    ok: r.ok,
+                    status: r.status,
+                    ctype: (r.headers.get('content-type') || '').toLowerCase(),
+                    text: text
+                })))
+                .then(res => {
+                    clearTimeout(hung);
+                    res.body = null;
+                    if (res.text) {
+                        try { res.body = JSON.parse(res.text); } catch (e) { res.isHtml = true; }
+                    }
+                    // 403 with "Invalid or missing pay_ticket" → session expired/already paid.
+                    if (res.status === 403 && res.body && res.body.message &&
+                        res.body.message.indexOf('pay_ticket') !== -1) {
+                        closeGpioModal();
+                        showNotification('Session expired or already paid, please try again', 'error');
+                        return;
+                    }
+                    // 423 or code:"paying" → another device is mid-payment.
+                    if (res.status === 423 || (res.body && res.body.code === 'paying')) {
+                        closeGpioModal();
+                        showPayingMessage();
+                        return;
+                    }
+                    // The API answered but not with our JSON 2xx. This is the
+                    // classic "broken build / lighttpd 404-fallback" case where
+                    // error-handler-404 returns HTTP 200 + index.html HTML; the
+                    // Go API is not actually answering /api/session/start.
+                    if (res.isHtml && attempt < 2) {
+                        setTimeout(function () { doSessionStart(attempt + 1); }, 1200);
+                        return;
+                    }
+                    closeGpioModal();
+                    if (!res.ok || !res.body || !res.body.session) {
+                        const msg = (res.body && (res.body.error || res.body.message)) ||
+                            'Failed to start session. Please try again.';
+                        showNotification(msg, 'error');
+                        return;
+                    }
+                    if (res.body && res.body.session_token) {
+                        storeSessionToken(res.body.session_token);
+                    }
+                    // Done paying success: stop insert-coin loop, play done-paying sound
+                    stopAudio(audioInsertCoin);
+                    playAudioSafe(audioDonePaying);
+                    applyServerSession(res.body.session, res.body.extended);
+                    maybeShowPostPay();
+                })
+                .catch(err => {
+                    clearTimeout(hung);
+                    closeGpioModal();
+                    warnOnce('session start', err);
+                    showNotification('Could not reach the server to start the session.', 'error');
+                });
+        }
+
+        // ==================== VOUCHER REDEMPTION ====================
+        // Redeems a 6-char voucher code for the CALLING device. The server
+        // identifies the caller by IP/MAC (same trust model as coin
+        // payment), credits the voucher's minutes and binds the voucher
+        // to the session's roaming token — so the subscriber keeps
+        // internet when moving between SSIDs.
+        function redeemVoucher() {
+            var input = document.getElementById('voucherInput');
+            var btn = document.getElementById('voucherRedeemBtn');
+            var code = (input.value || '').trim().toUpperCase();
+            if (code.length !== 6) {
+                showNotification('Please enter the 6-character voucher code', 'error');
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
+
+            fetch('/api/session/redeem', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Session-Token': getSessionToken() },
+                body: JSON.stringify({ code: code, session_token: getSessionToken() })
+            })
+                .then(r => r.json().catch(() => ({})).then(body => ({ ok: r.ok, body: body })))
+                .then(res => {
+                    btn.disabled = false;
+                    btn.textContent = 'Use Voucher';
+                    if (!res.ok || !res.body || !res.body.success || !res.body.session) {
+                        var msg = (res.body && res.body.message) || 'Invalid or already used voucher code';
+                        showNotification(msg, 'error');
+                        return;
+                    }
+                    // Bind the roaming token so the session follows the
+                    // device across SSIDs.
+                    if (res.body.session_token) storeSessionToken(res.body.session_token);
+                    input.value = '';
+                    showNotification('Voucher accepted — enjoy your internet!', 'success');
+                    playAudioSafe(audioDonePaying);
+                    applyServerSession(res.body.session, res.body.extended);
+                    maybeShowPostPay();
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.textContent = 'Use Voucher';
+                    warnOnce('voucher redeem', err);
+                    showNotification('Could not reach the server to redeem the voucher.', 'error');
+                });
+        }
+
+        function closeGpioModal() {
+            clearInterval(gpio.countdownInterval);
+            if (gpio.statusInterval) {
+                clearInterval(gpio.statusInterval);
+                gpio.statusInterval = null;
+            }
+            gpio.active = false;
+            coinslotDisarm();
+            document.getElementById('gpioModal').classList.remove('active');
+            // Stop all portal audio when modal closes (any path: success, cancel, error)
+            stopAllPortalAudio();
+        }
+
+        function gpioCancel() {
+            // Reset GPIO state - discard any coins inserted
+            gpio.coins = [];
+            gpio.totalAmount = 0;
+            gpio.totalSeconds = 0;
+            closeGpioModal();
+            showNotification('Coin insertion cancelled', 'info');
+        }
+
+        // Auto-redirects the client to the operator-configured landing URL after
+        // a successful payment / voucher redemption. Silent no-op when no
+        // redirect_url is configured, so the feature is invisible by default.
+        function maybeShowPostPay() {
+            var url = (window._portalRedirect || '').trim();
+            if (!url) return;
+            try {
+                var parsed = new URL(url);
+                if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                    // A tiny delay lets the "connected" state settle and the
+                    // session apply before the browser navigates away.
+                    setTimeout(function () {
+                        window.location.href = parsed.href;
+                    }, 800);
+                }
+            } catch (e) { /* malformed — treat as unset */ }
+        }
+
+        // Mirrors a session object returned by the server (POST
+        // /api/session/start) into the local display state and shows the
+        // home session card with the REAL remaining time.
+        function applyServerSession(session, extended) {
+            const remaining = parseInt(session.remaining, 10) || 0;
+            const coins = parseInt(session.coins, 10) || 0;
+            const total = parseInt(session.total, 10) || 0;
+
+            if (remaining <= 0) {
+                sessionExpired();
+                return;
+            }
+
+            state.sessionActive = true;
+            state.remainingSeconds = remaining;
+            state.totalSeconds = Math.max(total, remaining);
+            state.coinsInserted = coins;
+
+            document.getElementById('sessionStatus').textContent = 'Connected';
+            document.getElementById('sessionStatus').style.color = '#00ff88';
+            document.getElementById('runningTimerBar').classList.add('active');
+            document.getElementById('runningTotalCoins').textContent = '₱' + coins;
+
+            updateSessionView();
+            startTimer();
+            startRunningTimer();
+
+            showNotification(extended
+                ? 'Time added! Enjoy browsing.'
+                : 'Session started! Enjoy browsing.', 'success');
+        }
+
+        // Running timer on the home session card (hh:mm:ss) - COUNTDOWN
+        function startRunningTimer() {
+            if (gpio.sessionInterval) clearInterval(gpio.sessionInterval);
+
+            // Update immediately then every second
+            updateRunningTimerDisplay();
+
+            gpio.sessionInterval = setInterval(() => {
+                if (!state.sessionActive) {
+                    clearInterval(gpio.sessionInterval);
+                    document.getElementById('runningTimerBar').classList.remove('active');
+                    return;
+                }
+
+                updateRunningTimerDisplay();
+            }, 1000);
+        }
+
+        function updateRunningTimerDisplay() {
+            // Use remainingSeconds from the session countdown
+            const remaining = state.remainingSeconds;
+            const hours = Math.floor(remaining / 3600);
+            const mins = Math.floor((remaining % 3600) / 60);
+            const secs = remaining % 60;
+
+            const display = String(hours).padStart(2, '0') + ':' +
+                           String(mins).padStart(2, '0') + ':' +
+                           String(secs).padStart(2, '0');
+
+            document.getElementById('runningTimerValue').textContent = display;
+
+            // Change color when low
+            if (remaining <= 60) {
+                document.getElementById('runningTimerValue').style.color = '#ff4444';
+            } else if (remaining <= 300) {
+                document.getElementById('runningTimerValue').style.color = '#ffd700';
+            } else {
+                document.getElementById('runningTimerValue').style.color = '#00d4ff';
+            }
+        }
+
+        // ==================== SESSION / SYSTEM STATUS POLLING ====================
+        // GET /api/session/status (Go API, proxied by lighttpd) reports the
+        // caller's active session and whether the system is up. It replaces
+        // the old file-based /api/status.json of the demo build, which no
+        // longer exists on the device: because lighttpd answers unknown paths
+        // with index.html (HTTP 200 + HTML), that poll never failed loudly, it
+        // just never delivered any data. Coin events are NOT polled here —
+        // they arrive through /api/coinslot/status while the modal is armed.
+
+        const API_ENABLED = true;           // Set false to disable API polling
+        const API_POLL_INTERVAL = 2000;     // Server sync every 2 seconds
+        const API_STATUS_URL = '/api/session/status';
+        const SESSION_START_URL = '/api/session/start';
+        let apiPollTimer = null;
+
+        // Poll backend for session status and system health. The local 1s
+        // countdown (startTimer) only smooths the display between these
+        // polls — the server's remaining seconds always win.
+        function apiPoll() {
+            if (!API_ENABLED) return;
+
+            fetchJSON(API_STATUS_URL + '?t=' + Date.now())
+                .then(data => {
+                    // --- License lockdown ---
+                    if (data && data.license_required === true) {
+                        document.getElementById('license-lockdown').style.display = 'flex';
+                        return;
+                    }
+                    document.getElementById('license-lockdown').style.display = 'none';
+                    const sess = data && data.session;
+                    // If the server issued or echoed a session token, persist
+                    // it so future requests carry the same identity.
+                    var srvTok = (data && data.session_token) || (sess && sess.session_token);
+                    if (srvTok) storeSessionToken(srvTok);
+                    const backendRemaining = sess ? (parseInt(sess.remaining, 10) || 0) : 0;
+                    const isActive = !!(sess && sess.status === 'active' && backendRemaining > 0);
+                    const isPaused = !!(sess && sess.paused);
+
+                    // --- Ban state ---
+                    const ban = data && data.ban;
+                    if (ban && ban.banned && ban.banned_until) {
+                        applyBanState(ban.banned_until);
+                    } else {
+                        clearBanState();
+                    }
+
+                    if (isActive) {
+                        const backendCoins = parseInt(sess.coins, 10) || 0;
+                        const backendTotal = parseInt(sess.total, 10) || backendRemaining;
+
+                        if (!state.sessionActive) {
+                            // Session exists on the server (page reload or
+                            // credited elsewhere) — mirror it locally.
+                            state.sessionActive = true;
+                            state.totalSeconds = Math.max(backendTotal, backendRemaining);
+                            startTimer();
+                            startRunningTimer();
+                        }
+
+                        // Handle pause state change
+                        if (isPaused !== state.sessionPaused) {
+                            state.sessionPaused = isPaused;
+                            if (isPaused) {
+                                // Server says paused: freeze the countdown
+                                if (state.timerInterval) clearInterval(state.timerInterval);
+                                if (gpio.sessionInterval) clearInterval(gpio.sessionInterval);
+                            } else {
+                                // Server says resumed: restart countdown
+                                startTimer();
+                                startRunningTimer();
+                            }
+                        }
+
+                        // Re-align the display with the server.
+                        // When paused, remaining is frozen by the server so
+                        // we accept it as-is without the local countdown.
+                        if (!state.sessionPaused) {
+                            state.remainingSeconds = backendRemaining;
+                        } else {
+                            state.remainingSeconds = backendRemaining;
+                        }
+                        state.coinsInserted = backendCoins;
+                        if (backendTotal > state.totalSeconds) state.totalSeconds = backendTotal;
+
+                        document.getElementById('sessionStatus').textContent =
+                            isPaused ? 'Paused' : 'Connected';
+                        document.getElementById('sessionStatus').style.color =
+                            isPaused ? '#ffd700' : '#00ff88';
+                        document.getElementById('runningTimerBar').classList.add('active');
+                        document.getElementById('runningTotalCoins').textContent = '₱' + backendCoins;
+
+                        // PAUSED overlay
+                        var po = document.getElementById('pausedOverlay');
+                        if (isPaused) { po.classList.add('active'); }
+                        else { po.classList.remove('active'); }
+
+                        // Pause/Resume button visibility
+                        var prBtn = document.getElementById('pauseResumeBtn');
+                        prBtn.classList.add('active');
+                        prBtn.innerHTML = isPaused ? '&#9654; Resume' : '&#9208; Pause';
+
+                        updateTimerDisplay();
+                        updateSessionView();
+                    } else {
+                        if (state.sessionActive) {
+                            // The server no longer reports an active session:
+                            // it expired or was terminated by the admin.
+                            sessionExpired();
+                        }
+                        // Hide pause button when no session
+                        document.getElementById('pauseResumeBtn').classList.remove('active');
+                        document.getElementById('pausedOverlay').classList.remove('active');
+                    }
+
+                    // Sync system status
+                    if (data.system) {
+                        const indicator = document.getElementById('systemStatus');
+                        const statusText = document.getElementById('statusText');
+                        if (data.system.online === false) {
+                            state.systemOnline = false;
+                            indicator.className = 'status-indicator status-offline';
+                            statusText.textContent = 'System Offline';
+                        } else {
+                            state.systemOnline = true;
+                            indicator.className = 'status-indicator status-online';
+                            statusText.textContent = 'System Online';
+                        }
+                        // Update WhoAmI card with MAC/IP from the
+                        // backend and the localStorage session token.
+                        var whoamiMAC = document.getElementById('whoamiMAC');
+                        var whoamiIP  = document.getElementById('whoamiIP');
+                        var whoamiTok = document.getElementById('whoamiToken');
+                        if (whoamiMAC) whoamiMAC.textContent = data.system.client_mac || '—';
+                        if (whoamiIP)  whoamiIP.textContent  = data.system.ip || '—';
+                        if (whoamiTok) whoamiTok.textContent = getSessionToken() || '—';
+                    }
+                })
+                .catch(err => {
+                    // API not reachable (backend down, or file:// preview)
+                    warnOnce('session status', err);
+                });
+        }
+
+        // Start API polling
+        function startApiPolling() {
+            if (apiPollTimer) clearInterval(apiPollTimer);
+            apiPoll(); // Immediate first poll
+            apiPollTimer = setInterval(apiPoll, API_POLL_INTERVAL);
+        }
+
+        // ==================== PAYING LOCK UI ====================
+        // Shows the "SOMEBODY IS PAYING" overlay on the INSERT COIN area
+        // and disables the button for a 5-second cooldown. The modal
+        // (if open) is closed by the caller before calling this.
+        let payingCooldownTimer = null;
+        function showPayingMessage() {
+            var overlay = document.getElementById('payingOverlay');
+            var btn = document.getElementById('insertCoinBtn');
+            overlay.classList.add('active');
+            btn.style.pointerEvents = 'none';
+            btn.style.opacity = '0.4';
+            if (payingCooldownTimer) clearTimeout(payingCooldownTimer);
+            payingCooldownTimer = setTimeout(function () {
+                overlay.classList.remove('active');
+                btn.style.pointerEvents = '';
+                btn.style.opacity = '';
+                payingCooldownTimer = null;
+            }, 5000);
+        }
+
+        // ==================== BAN OVERLAY ====================
+        function applyBanState(bannedUntil) {
+            state.banUntil = bannedUntil;
+            var btn = document.getElementById('insertCoinBtn');
+            var badge = document.getElementById('banBadge');
+            btn.classList.add('banned');
+            badge.classList.add('active');
+            updateBanCountdown();
+            if (!state.banTimer) {
+                state.banTimer = setInterval(updateBanCountdown, 1000);
+            }
+        }
+
+        function clearBanState() {
+            if (!state.banUntil) return;
+            state.banUntil = null;
+            if (state.banTimer) { clearInterval(state.banTimer); state.banTimer = null; }
+            document.getElementById('insertCoinBtn').classList.remove('banned');
+            document.getElementById('banBadge').classList.remove('active');
+        }
+
+        function updateBanCountdown() {
+            if (!state.banUntil) return;
+            var ms = new Date(state.banUntil).getTime() - Date.now();
+            if (ms <= 0) {
+                clearBanState();
+                return;
+            }
+            var secs = Math.ceil(ms / 1000);
+            var h = String(Math.floor(secs / 3600)).padStart(2, '0');
+            var m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+            var s = String(secs % 60).padStart(2, '0');
+            document.getElementById('banBadge').textContent =
+                '\u{1F6AB} Banned \u2014 try again in ' + h + ':' + m + ':' + s;
+        }
+
+        // ==================== PAUSE / RESUME ====================
+        async function togglePauseResume() {
+            var btn = document.getElementById('pauseResumeBtn');
+            btn.disabled = true;
+            try {
+                var url = state.sessionPaused ? '/api/session/resume' : '/api/session/pause';
+                var resp = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' } });
+                var res = await resp.json();
+                if (res && res.success) {
+                    if (state.sessionPaused) {
+                        // Was paused, now resumed
+                        state.sessionPaused = false;
+                        btn.innerHTML = '&#9208; Pause';
+                        document.getElementById('pausedOverlay').classList.remove('active');
+                        document.getElementById('sessionStatus').textContent = 'Connected';
+                        document.getElementById('sessionStatus').style.color = '#00ff88';
+                        startTimer();
+                        startRunningTimer();
+                        showNotification('Session resumed', 'success');
+                    } else {
+                        // Was running, now paused
+                        state.sessionPaused = true;
+                        btn.innerHTML = '&#9654; Resume';
+                        document.getElementById('pausedOverlay').classList.add('active');
+                        document.getElementById('sessionStatus').textContent = 'Paused';
+                        document.getElementById('sessionStatus').style.color = '#ffd700';
+                        if (state.timerInterval) clearInterval(state.timerInterval);
+                        if (gpio.sessionInterval) clearInterval(gpio.sessionInterval);
+                        showNotification('Session paused', 'info');
+                    }
+                } else {
+                    showNotification((res && res.message) || 'Failed', 'error');
+                }
+            } catch (e) {
+                showNotification('Error: ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // Stop API polling
+        function stopApiPolling() {
+            if (apiPollTimer) {
+                clearInterval(apiPollTimer);
+                apiPollTimer = null;
+            }
+        }
+
+        // Auto-start API polling when page loads
+        startApiPolling();
+        updateDebugToken();
+
+        // Pre-fill the voucher input from ?voucher=CODE (printed QR codes
+        // point at this portal URL so customers can redeem with one tap).
+        (function () {
+            try {
+                var qp = new URLSearchParams(window.location.search);
+                var vc = (qp.get('voucher') || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+                if (vc) {
+                    var el = document.getElementById('voucherInput');
+                    if (el) el.value = vc;
+                }
+            } catch (e) { /* ignore — manual entry still works */ }
+        })();
+
+
+
+    </script>
+
+    <!-- License lockdown overlay — shown when license_required === true -->
+    <div id="license-lockdown" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; z-index:10000; background:rgba(0,0,0,0.92); justify-content:center; align-items:center; flex-direction:column; text-align:center; padding:40px;">
+        <div style="font-size:48px; margin-bottom:20px;">🔒</div>
+        <div style="font-size:22px; font-weight:600; color:#f44336; margin-bottom:12px;">System Unavailable</div>
+        <div style="font-size:14px; color:#aaa; max-width:320px;">Please contact the operator. This system requires a valid license to operate.</div>
+    </div>
+
+    <!-- Debug session-token display -->
+    <div id="debugTokenBar" style="position:fixed;bottom:0;left:0;right:0;text-align:center;padding:4px 8px;font-size:11px;font-family:monospace;color:#666;background:rgba(0,0,0,0.4);z-index:9999;pointer-events:none;">Session Token: <span id="debugTokenValue">…</span></div>
+</body>
+</html>

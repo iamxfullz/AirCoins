@@ -1,0 +1,83 @@
+#!/bin/bash
+# ============================================
+# AirCoins - Session Manager (watchdog)
+# ============================================
+# The Go API (aircoins-api) is the single owner of the session lifecycle:
+#   - POST /api/session/start credits the armed window's coins, creates or
+#     extends the sessions row and authorizes the client MAC
+#     (aircoins-captive-rules auth)
+#   - a 30s ticker inside the API expires sessions past expires_at and
+#     revokes access (aircoins-captive-rules unauth), with startup
+#     recovery after reboots
+#
+# This script therefore no longer processes coin events or ticks
+# sessions. Older builds polled the API here and POSTed sessions with
+# client_ip:"local" — that created phantom sessions for no real device
+# and has been removed on purpose. Do NOT reintroduce it.
+#
+# What remains is a light watchdog loop: it logs when the API becomes
+# unreachable so an operator reading /var/log/pisowifi/session.log can
+# tell why sessions stopped moving.
+#
+# Install to: /usr/local/bin/pisowifi-session-manager
+# Runs as: systemd service (pisowifi-session.service)
+# ============================================
+
+# ============================================
+# CONFIGURATION
+# ============================================
+# Central interface/network config (kept for operators who source vars)
+PISOWIFI_CONF="/etc/pisowifi/pisowifi.conf"
+[ -f "$PISOWIFI_CONF" ] && source "$PISOWIFI_CONF"
+
+LOG_FILE="/var/log/pisowifi/session.log"
+PID_FILE="/var/run/pisowifi-session.pid"
+
+API_URL="http://localhost:8080"
+CHECK_INTERVAL=30
+
+# ============================================
+# LOGGING
+# ============================================
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# ============================================
+# CLEANUP
+# ============================================
+cleanup() {
+    log "Session Manager stopping..."
+    rm -f "$PID_FILE"
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT EXIT
+
+# ============================================
+# INIT
+# ============================================
+mkdir -p "$(dirname "$LOG_FILE")"
+echo $$ > "$PID_FILE"
+log "Session Manager started (PID: $$) - watchdog mode, session lifecycle is owned by aircoins-api"
+
+# ============================================
+# MAIN LOOP (API health watchdog)
+# ============================================
+api_was_up=1
+
+while true; do
+    if curl -s -m 5 "$API_URL/api/health" > /dev/null 2>&1; then
+        if [ "$api_was_up" -eq 0 ]; then
+            log "aircoins-api is reachable again"
+            api_was_up=1
+        fi
+    else
+        if [ "$api_was_up" -eq 1 ]; then
+            log "WARNING: aircoins-api is NOT reachable at $API_URL - sessions will not start or expire until it is back"
+            api_was_up=0
+        fi
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done
