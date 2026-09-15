@@ -473,6 +473,17 @@ elif [ -f "/opt/aircoins/.env" ]; then
     chown root:root /opt/aircoins/.env
     chmod 600 /opt/aircoins/.env
     echo "  ✓ /opt/aircoins/.env preserved (license credentials)"
+elif [ -f "$SCRIPT_DIR/.env.example" ]; then
+    mkdir -p /opt/aircoins
+    cp "$SCRIPT_DIR/.env.example" /opt/aircoins/.env
+    chown root:root /opt/aircoins/.env
+    chmod 600 /opt/aircoins/.env
+    echo "  ✓ .env.example → /opt/aircoins/.env (license credentials)"
+elif [ -f "/opt/aircoins/.env.example" ]; then
+    cp "/opt/aircoins/.env.example" /opt/aircoins/.env
+    chown root:root /opt/aircoins/.env
+    chmod 600 /opt/aircoins/.env
+    echo "  ✓ /opt/aircoins/.env.example → /opt/aircoins/.env (license credentials)"
 else
     echo -e "  ${YELLOW}⚠ No .env file found. License system requires SUPABASE_URL and SUPABASE_ANON_KEY.${NC}"
     echo -e "  ${YELLOW}  Create /opt/aircoins/.env with these variables before starting the service.${NC}"
