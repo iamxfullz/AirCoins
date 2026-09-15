@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-var Version = "v1.29.14"
+var Version = "v1.29.15"
 
 func main() {
 	// Database configuration
@@ -402,7 +402,7 @@ func resolveVersion() string {
 			}
 		}
 	}
-	return "v1.29.14"
+	return "v1.29.15"
 }
 
 func getEnv(key, defaultValue string) string {

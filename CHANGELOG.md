@@ -1,6 +1,9 @@
 # Changelog
 
-## v1.29.13
+## v1.29.15
+- **Feature: Dynamic Portal Branding (Portal Title & Tagline)** — Admins and operators can now customize the customer portal name ("Portal Brand Name") and subtitle ("Portal Tagline") directly from the Admin > Portal appearance tab without editing any HTML files. Changes reflect in real-time across the customer captive portal navigation bar, hero banner, and page title.
+- **Fix: Paused session roaming** — Fixed captive portal session state to ensure paused devices reconnecting with randomized or device MACs are properly held at the captive portal until explicitly resumed.
+- **Enhancement: Automated one-step build & release** — Updated `publish-release.sh` to automatically build the release package if not already assembled and preserve version history in `manifest.json`.
 - **Removal: Sub-Vendo (NodeMCU) support deleted entirely — GPIO is the only coinslot.** The SBC's GPIO coin listener and the NodeMCU sub-vendo feature were fighting over the same coin pipeline: the `auto` coinslot resolution preferred a remote unit over GPIO, coins could be credited under `subvendo:<id>` sources the GPIO-only start path then failed to find, and the admin GPIO master toggle was entangled with the NodeMCU arm/approval lifecycle. Sub-vendo is now gone: the `/api/subvendo/*` device routes, `/api/admin/subvendos` + `/api/admin/ssid-vlan-map` admin routes, `handlers/subvendo.go`, the admin **Sub-Vendos** page and **Settings → SSID/VLAN Map** card, the portal's "Select Vendo Machine" picker, the `firmware/` NodeMCU sketch, and the `sub_vendos` / `ssid_vlan_map` tables (dropped at startup by EnsureSchema and by migrations.sql) are all removed. Arm/status/start now always target `local_gpio`, so Done Paying credits the coins the GPIO listener recorded — the GPIO toggle simply starts/stops the listener again.
 - Coinslot API compatibility: `/api/coinslot/arm|status|disarm|options` still accept the old `coinslot` parameter and `options` still returns a `subvendos: []` field, so cached portal pages keep working until they refresh — everything resolves to the GPIO coinslot.
 

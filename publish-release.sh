@@ -28,10 +28,14 @@ fi
 TARBALL="aircoins-v${VERSION}.tar.gz"
 CHECKSUM="aircoins-v${VERSION}.sha256"
 
-# Verify tarball exists
+# Verify tarball exists, or build it
 if [ ! -f "$TARBALL" ]; then
-    echo "ERROR: $TARBALL not found in current directory"
-    exit 1
+    echo "Tarball $TARBALL not found. Building with build-release.sh..."
+    bash build-release.sh "$VERSION"
+    if [ ! -f "$TARBALL" ]; then
+        echo "ERROR: Failed to build $TARBALL"
+        exit 1
+    fi
 fi
 
 echo "=== Publishing AirCoins v${VERSION} to Supabase Storage ==="
@@ -73,25 +77,72 @@ echo "  Generating manifest..."
 SHA256=$(cat "${CHECKSUM}" | awk '{print $1}')
 RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# JSON-escape the changelog content: try python3 first, fall back to bash-only escaping
 if command -v python3 &>/dev/null; then
-    RELEASE_NOTES=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" < "${CHANGELOG_FILE}")
+    python3 -c "
+import json, urllib.request, sys
+
+version = 'v${VERSION}'
+released_at = '${RELEASED_AT}'
+tarball = 'releases/${TARBALL}'
+sha256 = '${SHA256}'
+
+with open('${CHANGELOG_FILE}', 'r', encoding='utf-8') as f:
+    release_notes = f.read().strip()
+
+new_entry = {
+    'version': version,
+    'released_at': released_at,
+    'release_notes': release_notes,
+    'tarball': tarball,
+    'sha256': sha256
+}
+
+existing_versions = []
+try:
+    url = '${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/manifest.json'
+    req = urllib.request.Request(url, headers={'Cache-Control': 'no-cache', 'User-Agent': 'AirCoins-Publisher'})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+        existing_versions = data.get('versions', [])
+except Exception:
+    pass
+
+versions = [new_entry] + [v for v in existing_versions if v.get('version') != version][:4]
+
+manifest = {
+    'version': version,
+    'released_at': released_at,
+    'release_notes': release_notes,
+    'tarball': tarball,
+    'sha256': sha256,
+    'versions': versions
+}
+
+with open('manifest-tmp.json', 'w', encoding='utf-8') as f:
+    json.dump(manifest, f, indent=2)
+"
 else
     # Bash-only fallback: escape backslashes, double quotes, and newlines for valid JSON
     RELEASE_NOTES=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g' "${CHANGELOG_FILE}")
-    RELEASE_NOTES="\"${RELEASE_NOTES}\""
-fi
-
-# Create manifest.json
-cat > manifest-tmp.json << EOF
+    cat > manifest-tmp.json << EOF
 {
     "version": "v${VERSION}",
     "released_at": "${RELEASED_AT}",
-    "release_notes": ${RELEASE_NOTES},
+    "release_notes": "${RELEASE_NOTES}",
     "tarball": "releases/${TARBALL}",
-    "sha256": "${SHA256}"
+    "sha256": "${SHA256}",
+    "versions": [
+        {
+            "version": "v${VERSION}",
+            "released_at": "${RELEASED_AT}",
+            "release_notes": "${RELEASE_NOTES}",
+            "tarball": "releases/${TARBALL}",
+            "sha256": "${SHA256}"
+        }
+    ]
 }
 EOF
+fi
 
 curl -s -X POST "${SUPABASE_URL}/storage/v1/object/${BUCKET}/manifest.json" \
     -H "Authorization: Bearer ${SUPABASE_KEY}" \

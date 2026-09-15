@@ -73,7 +73,7 @@ TARBALL_DIR="$STAGING_DIR/$TARBALL_NAME"
 mkdir -p "$TARBALL_DIR/system"
 
 # Copy root-level files
-for f in install.sh aircoins-recover.sh .env.example index.html admin.html DEPLOYMENT.md CHANGELOG.md; do
+for f in install.sh aircoins-recover.sh .env.example index.html admin.html DEPLOYMENT.md CHANGELOG.md VERSION; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
         cp "$SCRIPT_DIR/$f" "$TARBALL_DIR/"
     else
