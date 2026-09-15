@@ -1191,28 +1191,26 @@
 
                     // The :root defaults ARE the dark theme, with the legacy
                     // gradients the hex-only API contract cannot express.
-                    // Dark without an image therefore changes nothing — the
-                    // portal stays pixel-identical to the built-in look.
                     const isDark = res.data.theme === 'dark';
-                    if (isDark && !img) return;
+                    if (!isDark || img) {
+                        const rs = document.documentElement.style;
+                        if (!isDark) {
+                            rs.setProperty('--pp-primary', c.primary);
+                            rs.setProperty('--pp-accent', c.accent);
+                            rs.setProperty('--pp-card', c.card);
+                            rs.setProperty('--pp-text', c.text);
+                            rs.setProperty('--pp-btn', c.button);
+                            rs.setProperty('--pp-btn-text', c.button_text);
+                        }
 
-                    const rs = document.documentElement.style;
-                    if (!isDark) {
-                        rs.setProperty('--pp-primary', c.primary);
-                        rs.setProperty('--pp-accent', c.accent);
-                        rs.setProperty('--pp-card', c.card);
-                        rs.setProperty('--pp-text', c.text);
-                        rs.setProperty('--pp-btn', c.button);
-                        rs.setProperty('--pp-btn-text', c.button_text);
-                    }
-
-                    if (img) {
-                        // Cover image + dark overlay keeps the text readable
-                        rs.setProperty('--pp-bg',
-                            'linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0.55)), ' +
-                            'url("' + img + '") center / cover no-repeat, ' + c.background);
-                    } else {
-                        rs.setProperty('--pp-bg', c.background);
+                        if (img) {
+                            // Cover image + dark overlay keeps the text readable
+                            rs.setProperty('--pp-bg',
+                                'linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0.55)), ' +
+                                'url("' + img + '") center / cover no-repeat, ' + c.background);
+                        } else {
+                            rs.setProperty('--pp-bg', c.background);
+                        }
                     }
 
                     const headerImg = PP_BG_RE.test(res.data.header_image || '')

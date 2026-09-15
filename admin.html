@@ -1631,7 +1631,7 @@
 <!-- ==================== LOGIN SCREEN ==================== -->
 <div id="login-screen">
     <div class="login-card">
-        <div class="logo"><span class="cyan">Air</span><span class="gold">Coins</span></div>
+        <div class="logo" id="adminLoginLogo"><span class="cyan">Air</span><span class="gold">Coins</span></div>
         <p class="subtitle">Admin Panel — Sign in to continue</p>
         <input type="text" id="login-user" placeholder="Username" autocomplete="username">
         <input type="password" id="login-pass" placeholder="Password" autocomplete="current-password">
@@ -1650,7 +1650,7 @@
     <!-- Sidebar -->
     <aside id="sidebar">
         <div class="sidebar-header">
-            <span class="logo-text"><span style="color:#00d4ff;">Air</span><span style="color:#ffd700;">Coins</span></span>
+            <span class="logo-text" id="adminSidebarLogo"><span style="color:#00d4ff;">Air</span><span style="color:#ffd700;">Coins</span></span>
             <button id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">&#9776;</button>
         </div>
         <nav>
@@ -2263,6 +2263,9 @@
                                        style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#fff; font-size:14px;"
                                        autocomplete="off">
                                 <div class="gpio-info-text" style="margin-top:4px;">Greeting subtitle shown beneath the welcome header.</div>
+                            </div>
+                            <div style="margin-top:14px; display:flex; gap:10px;">
+                                <button class="btn btn-primary" onclick="savePortalAppearance()" style="padding:8px 18px; font-size:13px; font-weight:600;">💾 Save Branding</button>
                             </div>
                         </div>
                     </div>
@@ -3282,6 +3285,7 @@ async function login(username, password) {
     }
 
     showSection('dashboard');
+    fetchAndApplyAdminBranding();
     showNotification('Welcome back, admin!', 'success');
 }
 
@@ -5613,6 +5617,9 @@ async function loadPortalAppearance() {
         if (pTitle) pTitle.value = portalAppearance.portal_title;
         var pTagline = document.getElementById('portal-tagline-input');
         if (pTagline) pTagline.value = portalAppearance.portal_tagline;
+        if (portalAppearance.portal_title) {
+            applyBrandToAdminUI(portalAppearance.portal_title);
+        }
     } catch (e) {
         portalAppearance = {
             theme: 'dark',
@@ -5625,6 +5632,25 @@ async function loadPortalAppearance() {
         showNotification('Failed to load portal appearance: ' + e.message, 'error');
     }
     syncPortalEditor();
+}
+
+function applyBrandToAdminUI(title) {
+    var t = (title || '').trim();
+    if (!t) return;
+    var logoEl = document.getElementById('adminSidebarLogo');
+    if (logoEl) logoEl.textContent = t;
+    var loginLogo = document.getElementById('adminLoginLogo');
+    if (loginLogo) loginLogo.textContent = t;
+    document.title = t + ' Admin';
+}
+
+async function fetchAndApplyAdminBranding() {
+    try {
+        var res = await apiCall('GET', '/portal/appearance');
+        if (res && res.data && res.data.portal_title) {
+            applyBrandToAdminUI(res.data.portal_title);
+        }
+    } catch (e) {}
 }
 
 async function savePortalAppearance() {
@@ -5646,6 +5672,7 @@ async function savePortalAppearance() {
         });
         portalAppearance.portal_title = portalTitle;
         portalAppearance.portal_tagline = portalTagline;
+        applyBrandToAdminUI(portalTitle);
         showNotification('Portal branding & appearance saved', 'success');
     } catch (e) {
         showNotification('Failed to save portal appearance: ' + e.message, 'error');
@@ -6867,6 +6894,9 @@ document.addEventListener('DOMContentLoaded', function() {
         document.getElementById('admin-panel').style.display = 'block';
         document.getElementById('sidebar').style.display = 'flex';
         showSection('dashboard');
+        fetchAndApplyAdminBranding();
+    } else {
+        fetchAndApplyAdminBranding();
     }
 });
 
