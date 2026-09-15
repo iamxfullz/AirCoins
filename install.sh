@@ -597,7 +597,9 @@ chmod +x /usr/local/bin/zerotier-install
 echo "  ✓ zerotier-install"
 
 # Ensure clean Linux LF line endings on all deployed scripts
-sed -i -e 's/\r$//' /usr/local/bin/aircoins-* /usr/local/bin/pisowifi-* /usr/local/bin/gpio-coin-listener /usr/local/bin/zerotier-install 2>/dev/null || true
+for s in /usr/local/bin/aircoins-gpio-lib /usr/local/bin/aircoins-vlan-apply /usr/local/bin/aircoins-captive-rules /usr/local/bin/gpio-coin-listener /usr/local/bin/pisowifi-ctl /usr/local/bin/pisowifi-session-manager /usr/local/bin/pisowifi-api-update /usr/local/bin/zerotier-install; do
+    [ -f "$s" ] && sed -i -e 's/\r$//' "$s" 2>/dev/null || true
+done
 
 echo -e "${GREEN}  ✓ All scripts deployed${NC}"
 
