@@ -596,6 +596,9 @@ cp "$SYSTEM_DIR/usr/local/bin/zerotier-install" /usr/local/bin/
 chmod +x /usr/local/bin/zerotier-install
 echo "  ✓ zerotier-install"
 
+# Ensure clean Linux LF line endings on all deployed scripts
+sed -i -e 's/\r$//' /usr/local/bin/aircoins-* /usr/local/bin/pisowifi-* /usr/local/bin/gpio-coin-listener /usr/local/bin/zerotier-install 2>/dev/null || true
+
 echo -e "${GREEN}  ✓ All scripts deployed${NC}"
 
 # ============================================
