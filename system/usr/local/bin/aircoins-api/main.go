@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-var Version = "dev"
+var Version = "v1.29.14"
 
 func main() {
 	// Database configuration
@@ -391,7 +391,7 @@ func resolveVersion() string {
 	if envV := strings.TrimSpace(os.Getenv("AIRCOINS_VERSION")); envV != "" {
 		return envV
 	}
-	for _, p := range []string{"/opt/aircoins/VERSION", "/etc/aircoins-version", "/var/lib/pisowifi/version"} {
+	for _, p := range []string{"/opt/aircoins/VERSION", "/etc/aircoins-version", "/var/lib/pisowifi/version", "VERSION"} {
 		if data, err := os.ReadFile(p); err == nil {
 			v := strings.TrimSpace(string(data))
 			if v != "" {
@@ -402,7 +402,7 @@ func resolveVersion() string {
 			}
 		}
 	}
-	return "dev"
+	return "v1.29.14"
 }
 
 func getEnv(key, defaultValue string) string {

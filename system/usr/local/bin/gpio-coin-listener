@@ -58,7 +58,7 @@ fi
 # CONFIGURATION
 # ============================================
 # Default values (overridden by config file)
-COIN_PULSE_PIN=7                    # PHYSICAL header pin number
+COIN_PULSE_PIN=3                    # PHYSICAL header pin number (default: Pin 3 / PA12)
 COIN_VALUE=1                        # Peso value per pulse (1 pulse = P1; a P10 coin must send 10 pulses)
 PULSE_MODE="falling"                # falling, rising, or both
 DEBOUNCE_MS=30                      # ignore edges closer than this to the previous pulse;

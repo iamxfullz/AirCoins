@@ -716,7 +716,7 @@ if [ "$IS_ARM" = true ]; then
     echo -e "  ${CYAN}Login:${NC}        admin / admin123"
     echo ""
     echo -e "  ${YELLOW}GPIO Wiring:${NC}"
-    echo -e "    Coin Acceptor Pulse → Physical Pin 7 (PA6)"
+    echo -e "    Coin Acceptor Pulse → Physical Pin 3 (PA12, configurable in Settings > GPIO)"
     echo -e "    Coin Acceptor GND   → Orange Pi GND"
 else
     echo -e "  ${CYAN}Portal URL:${NC}  http://localhost"
