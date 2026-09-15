@@ -89,18 +89,17 @@ fi
 # VALIDATE PROJECT STRUCTURE
 # ============================================
 if [ ! -d "$SYSTEM_DIR" ]; then
-    echo -e "${RED}ERROR: Project structure not found!${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Current directory:${NC} $SCRIPT_DIR"
-    echo -e "  ${YELLOW}Expected:${NC} $SYSTEM_DIR"
-    echo ""
-    echo -e "  ${RED}This script must be run from inside the AirCoins project directory.${NC}"
-    echo ""
-    echo -e "  ${CYAN}Fix:${NC}"
-    echo -e "    cd /opt/aircoins         # Navigate to project directory"
-    echo -e "    sudo bash install.sh     # Run installer from there"
-    echo ""
-    exit 1
+    echo -e "${YELLOW}AirCoins repository structure not found in current directory.${NC}"
+    echo -e "${CYAN}Auto-bootstrapping full repository to /opt/aircoins...${NC}"
+    apt-get update -qq && apt-get install -y -qq git
+    mkdir -p /opt
+    if [ ! -d "/opt/aircoins/.git" ]; then
+        git clone https://github.com/iamxfullz/AirCoins.git /opt/aircoins
+    else
+        cd /opt/aircoins && git pull
+    fi
+    cd /opt/aircoins
+    exec bash install.sh "$@"
 fi
 
 if [ ! -d "$SYSTEM_DIR/usr/local/bin/aircoins-api" ]; then
